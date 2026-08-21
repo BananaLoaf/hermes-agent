@@ -8,7 +8,7 @@ Tests cover:
 - Auth (valid key, invalid key, no key configured)
 - /v1/models endpoint
 - /health endpoint
-- System prompt extraction
+- Managed system prompt enforcement
 - Error handling (invalid JSON, missing fields)
 """
 
@@ -211,15 +211,23 @@ class TestAdapterInit:
             "gateway.run.GatewayRunner._load_reasoning_config",
             staticmethod(lambda model="": {"enabled": True, "effort": "xhigh"}),
         )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_ephemeral_system_prompt",
+            staticmethod(lambda: "  Operator-managed instruction  "),
+        )
         monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
         monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
 
-        agent = adapter._create_agent(session_id="api-session")
+        agent = adapter._create_agent(
+            session_id="api-session",
+            ephemeral_system_prompt="Untrusted client instruction",
+        )
 
         assert isinstance(agent, FakeAgent)
+        assert captured["ephemeral_system_prompt"] == "Operator-managed instruction"
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
         assert captured["checkpoints_enabled"] is True
         assert captured["checkpoint_max_snapshots"] == 7
@@ -2469,6 +2477,9 @@ def _patch_create_agent_runtime(monkeypatch, captured: dict, fake_agent_cls):
     monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
     monkeypatch.setattr(
         "gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda model="": {})
+    )
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_ephemeral_system_prompt", staticmethod(lambda: "")
     )
     monkeypatch.setattr(
         "gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None)

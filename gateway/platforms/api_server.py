@@ -2694,6 +2694,11 @@ class APIServerAdapter(BasePlatformAdapter):
         session ``/model`` override, disables the global fallback model
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
+
+        Client-provided ``system`` messages and Responses API ``instructions``
+        are intentionally ignored.  The API server always uses the
+        operator-managed ``agent.system_prompt`` resolved inside the active
+        profile scope.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -2952,6 +2957,15 @@ class APIServerAdapter(BasePlatformAdapter):
             else GatewayRunner._load_reasoning_config(model)
         )
 
+        # API clients are outside the operator trust boundary.  Do not let a
+        # Chat Completions `system` message or Responses `instructions`
+        # replace the deployment-managed instruction.  This lookup runs while
+        # _run_agent() holds the request's profile scope, so multiplexed routes
+        # resolve the managed config belonging to that profile.
+        managed_system_prompt = (
+            GatewayRunner._load_ephemeral_system_prompt() or ""
+        ).strip()
+
         agent_kwargs = {
             "model": model,
             **runtime_kwargs,
@@ -2959,7 +2973,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "max_iterations": max_iterations,
             "quiet_mode": True,
             "verbose_logging": False,
-            "ephemeral_system_prompt": ephemeral_system_prompt or None,
+            "ephemeral_system_prompt": managed_system_prompt or None,
             "enabled_toolsets": enabled_toolsets,
             "session_id": session_id,
             "platform": "api_server",
@@ -4192,7 +4206,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
-        # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
+        # Parse client system text for OpenAI request compatibility and the
+        # stateless session fingerprint only. _create_agent() enforces the
+        # managed-only policy and never passes this text to the model.
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
 
@@ -5422,7 +5438,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
             conversation_history = list(stored.get("conversation_history", []))
             stored_session_id = stored.get("session_id")
-            # If no instructions provided, carry forward from previous
+            # Preserve Responses API metadata continuity. _create_agent()
+            # ignores these client instructions under the managed-only policy.
             if instructions is None:
                 instructions = stored.get("instructions")
 
@@ -6734,6 +6751,8 @@ class APIServerAdapter(BasePlatformAdapter):
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
                 stored_session_id = stored.get("session_id")
+                # Preserve Responses/Runs metadata continuity only; the agent
+                # always receives the operator-managed prompt instead.
                 if instructions is None:
                     instructions = stored.get("instructions")
 
