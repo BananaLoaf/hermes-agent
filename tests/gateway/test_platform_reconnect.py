@@ -99,6 +99,7 @@ class TestStartupPlatformIsolation:
         runner._sync_voice_mode_state_to_adapter = MagicMock()
         runner._send_update_notification = AsyncMock(return_value=True)
         runner._send_restart_notification = AsyncMock()
+        runner._send_home_channel_startup_notifications = AsyncMock()
 
         adapters = {
             Platform.TELEGRAM: StubAdapter(platform=Platform.TELEGRAM),
@@ -137,6 +138,7 @@ class TestStartupPlatformIsolation:
         assert Platform.FEISHU in runner.adapters
         assert Platform.TELEGRAM not in runner.adapters
         assert runner._create_adapter.call_count == 2
+        runner._send_home_channel_startup_notifications.assert_awaited_once_with()
 
 
 class TestStartupFailureQueuing:
@@ -852,4 +854,3 @@ class TestVoiceInputCallbackWiring:
         assert adapter._voice_input_callback is not None, (
             "startup must wire _voice_input_callback"
         )
-

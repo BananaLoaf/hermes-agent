@@ -13207,17 +13207,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._booted_from_restart = True
         await self._send_restart_notification()
 
-        # Broadcast a lightweight "gateway is back" message to configured home
-        # channels only for non-chat planned restarts (terminal/SIGUSR1/service
-        # paths). Chat-originated /restart already has a precise reply target
-        # in .restart_notify.json, so keep that lifecycle in the originating
-        # chat/topic instead of also leaking it to the configured home channel.
-        if planned_restart_notification_pending:
-            try:
-                await self._send_home_channel_startup_notifications(
-                    skip_targets=None,
-                )
-            finally:
+        # Announce every successful gateway start once to each configured home
+        # channel. Reconnect attempts do not pass through this startup path.
+        try:
+            if connected_count > 0:
+                await self._send_home_channel_startup_notifications()
+        finally:
+            if planned_restart_notification_pending:
                 _clear_planned_restart_notification()
 
         # Automatically continue fresh sessions that were interrupted by the
@@ -24244,17 +24240,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _send_home_channel_startup_notifications(
         self,
-        *,
-        skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
     ) -> set[tuple[str, str, Optional[str]]]:
-        """Notify configured home channels that the gateway is back online.
-
-        The notification is best-effort and sent once per connected platform
-        home channel. ``skip_targets`` lets startup avoid duplicate messages
-        when a more specific restart notification is queued for the same chat.
-        """
+        """Notify configured home channels that the gateway is ready."""
         delivered: set[tuple[str, str, Optional[str]]] = set()
-        skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, platform_cfg in self.config.platforms.items():
@@ -24274,7 +24262,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             target = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
-            if target in skipped or target in delivered:
+            if target in delivered:
                 continue
 
             try:
