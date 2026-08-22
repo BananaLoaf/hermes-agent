@@ -194,6 +194,13 @@ _DEFAULT_PAYLOADS = {
         "approx_input_tokens": 2048,
         "request_char_count": 8192,
         "max_tokens": 4096,
+        "platform_user_id": "test-user",
+        "profile_name": "test-profile",
+        "environment_name": "test",
+        "platform_chat_id": "test-chat",
+        "platform_thread_id": "test-thread",
+        "conversation_id": "test-conversation",
+        "gateway_mode": "cli",
     },
     "post_api_request": {
         "session_id": "test-session",

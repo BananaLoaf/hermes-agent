@@ -18,6 +18,8 @@ Optional env vars:
   HERMES_LANGFUSE_RELEASE     - release/version tag
   HERMES_LANGFUSE_SAMPLE_RATE - sampling rate 0.0–1.0 (default: 1.0)
   HERMES_LANGFUSE_MAX_CHARS   - max chars per field (default: 12000)
+  HERMES_LANGFUSE_SYSTEM_PROMPT_MAX_CHARS
+                              - separate system-prompt limit (defaults to MAX_CHARS)
   HERMES_LANGFUSE_CAPTURE     - content capture mode (default: "sanitized")
       metadata  - no content: sizes, roles, tool names, IDs, usage, cost only
       sanitized - content with secret-pattern redaction + truncation
@@ -32,6 +34,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -118,6 +121,78 @@ def _debug(message: str) -> None:
         logger.info("Langfuse tracing: %s", message)
 
 
+@dataclass(frozen=True)
+class TraceIdentity:
+    user_id: Optional[str]
+    tags: list[str]
+    metadata: dict[str, str]
+
+
+def _identity_component(value: Any, *, lowercase: bool = False) -> str:
+    """Normalize one user-id component without pre-encoding it for URLs."""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if lowercase:
+        text = text.casefold()
+    return text
+
+
+def _build_trace_identity(
+    *,
+    platform_name: str,
+    platform_user_id: str,
+    profile_name: str = "",
+    environment_name: str = "",
+    session_id: str = "",
+    platform_chat_id: str = "",
+    platform_thread_id: str = "",
+    conversation_id: str = "",
+    gateway_mode: str = "",
+) -> TraceIdentity:
+    """Build stable Langfuse identity, low-cardinality tags and metadata."""
+    platform = _identity_component(platform_name, lowercase=True)
+    profile = _identity_component(profile_name, lowercase=True)
+    user = _identity_component(platform_user_id)
+
+    tags = ["hermes", "langfuse"]
+    platform_tag = unicodedata.normalize(
+        "NFKC", str(platform_name or "")
+    ).strip().casefold()
+    profile_tag = unicodedata.normalize(
+        "NFKC", str(profile_name or "")
+    ).strip().casefold()
+    if platform_tag:
+        tags.append(platform_tag)
+    if profile_tag:
+        tags.append(profile_tag)
+
+    metadata = {
+        "platform_name": str(platform_name or "").strip(),
+        "platform_user_id": str(platform_user_id or "").strip(),
+        "profile_name": str(profile_name or "").strip(),
+        "environment_name": str(environment_name or "").strip(),
+        "session_id": str(session_id or "").strip(),
+        "platform_chat_id": str(platform_chat_id or "").strip(),
+        "platform_thread_id": str(platform_thread_id or "").strip(),
+        "conversation_id": str(conversation_id or "").strip(),
+        "gateway_mode": str(gateway_mode or "").strip(),
+    }
+    metadata = {key: value for key, value in metadata.items() if value}
+
+    if not platform:
+        user_id = None
+        metadata["user_id_unset_reason"] = "platform_name_missing"
+    elif user:
+        user_id = "_".join(part for part in (profile, platform, user) if part)
+    elif gateway_mode == "openai_compatible_api" and profile:
+        user_id = "_".join((profile, platform))
+        metadata["user_identity_source"] = "profile_route"
+    else:
+        user_id = None
+        metadata["user_id_unset_reason"] = "platform_user_id_missing"
+
+    return TraceIdentity(user_id=user_id, tags=tags, metadata=metadata)
+
+
 # ---------------------------------------------------------------------------
 # Capture modes
 # ---------------------------------------------------------------------------
@@ -189,7 +264,8 @@ def _describe_content(value: Any, *, depth: int = 0) -> Any:
 
 
 def _capture_content(value: Any, *, parse_json_strings: bool = False,
-                     tool_name: str = "", args: Any = None) -> Any:
+                     tool_name: str = "", args: Any = None,
+                     max_chars: Optional[int] = None) -> Any:
     """Apply the active capture mode to a CONTENT value.
 
     Metadata fields (provider, model, IDs, counts) should NOT go through
@@ -201,7 +277,11 @@ def _capture_content(value: Any, *, parse_json_strings: bool = False,
         return _describe_content(value)
     if tool_name or args is not None:
         value = _normalize_payload(value, tool_name=tool_name, args=args)
-    return _safe_value(value, parse_json_strings=parse_json_strings)
+    return _safe_value(
+        value,
+        max_chars=max_chars,
+        parse_json_strings=parse_json_strings,
+    )
 
 
 # Sentinel: "_get_langfuse() has tried and failed". Lets us short-circuit
@@ -580,9 +660,28 @@ def _normalize_payload(value: Any, *, tool_name: str = "", args: Any = None) -> 
     return value
 
 
+def _configured_max_chars(name: str, default: int) -> int:
+    try:
+        return max(1, int(_env(name, str(default)) or str(default)))
+    except ValueError:
+        return default
+
+
+def _system_prompt_max_chars() -> int:
+    general_limit = _configured_max_chars("HERMES_LANGFUSE_MAX_CHARS", 12000)
+    return _configured_max_chars(
+        "HERMES_LANGFUSE_SYSTEM_PROMPT_MAX_CHARS",
+        general_limit,
+    )
+
+
 def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0,
                 parse_json_strings: bool = False) -> Any:
-    max_chars = max_chars if max_chars is not None else int(_env("HERMES_LANGFUSE_MAX_CHARS", "12000") or "12000")
+    max_chars = (
+        max_chars
+        if max_chars is not None
+        else _configured_max_chars("HERMES_LANGFUSE_MAX_CHARS", 12000)
+    )
     if depth > 4:
         return "<max-depth>"
     if value is None or isinstance(value, (int, float, bool)):
@@ -648,7 +747,13 @@ def _serialize_system_prompt(system_prompt: Any) -> Optional[dict[str, Any]]:
         text = system_prompt.strip()
         if not text:
             return None
-        return {"role": "system", "content": _capture_content(text)}
+        return {
+            "role": "system",
+            "content": _capture_content(
+                text,
+                max_chars=_system_prompt_max_chars(),
+            ),
+        }
     if isinstance(system_prompt, list):
         parts: list[str] = []
         for block in system_prompt:
@@ -664,7 +769,13 @@ def _serialize_system_prompt(system_prompt: Any) -> Optional[dict[str, Any]]:
                 parts.append(block)
         if not parts:
             return None
-        return {"role": "system", "content": _capture_content("\n\n".join(parts))}
+        return {
+            "role": "system",
+            "content": _capture_content(
+                "\n\n".join(parts),
+                max_chars=_system_prompt_max_chars(),
+            ),
+        }
     return None
 
 
@@ -709,6 +820,11 @@ def _serialize_messages(messages: Any) -> list[dict[str, Any]]:
             "content": _capture_content(
                 message.get("content"),
                 parse_json_strings=(role == "tool"),
+                max_chars=(
+                    _system_prompt_max_chars()
+                    if role == "system"
+                    else None
+                ),
             ),
         }
         if role == "tool":
@@ -880,11 +996,40 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
         return {}, {}
 
 
-def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
-                      api_mode: str, messages: Any, client: Langfuse,
-                      turn_id: str = "", api_request_id: str = "") -> TraceState:
+def _start_root_trace(
+    task_key: str,
+    *,
+    task_id: str,
+    session_id: str,
+    platform: str,
+    provider: str,
+    model: str,
+    api_mode: str,
+    messages: Any,
+    client: Langfuse,
+    turn_id: str = "",
+    api_request_id: str = "",
+    platform_user_id: str = "",
+    profile_name: str = "",
+    environment_name: str = "",
+    platform_chat_id: str = "",
+    platform_thread_id: str = "",
+    conversation_id: str = "",
+    gateway_mode: str = "",
+) -> TraceState:
     trace_id = client.create_trace_id(seed=f"{session_id or 'sessionless'}::{task_id or task_key}")
     trace_input = _extract_last_user_message(messages)
+    identity = _build_trace_identity(
+        platform_name=platform,
+        platform_user_id=platform_user_id,
+        profile_name=profile_name,
+        environment_name=environment_name,
+        session_id=session_id,
+        platform_chat_id=platform_chat_id,
+        platform_thread_id=platform_thread_id,
+        conversation_id=conversation_id,
+        gateway_mode=gateway_mode,
+    )
     metadata = {
         "source": "hermes",
         "task_id": task_id,
@@ -895,6 +1040,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "model": model,
         "api_mode": api_mode,
         "capture_mode": _capture_mode(),
+        **identity.metadata,
     }
 
     # session_id must be passed in trace_context for Langfuse session grouping.
@@ -904,10 +1050,16 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
 
     if propagate_attributes is not None:
         try:
+            propagated = {
+                "session_id": session_id or task_key,
+                "trace_name": "Hermes turn",
+                "tags": identity.tags,
+                "metadata": metadata,
+            }
+            if identity.user_id:
+                propagated["user_id"] = identity.user_id
             with propagate_attributes(
-                session_id=session_id or task_key,
-                trace_name="Hermes turn",
-                tags=["hermes", "langfuse"],
+                **propagated,
             ):
                 root_ctx = client.start_as_current_observation(
                     trace_context=trace_ctx,
@@ -942,7 +1094,16 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     # SDK v3 uses update_trace() (not set_trace_io). Failures must never block
     # the rest of the turn — the observation still carries input from start.
     try:
-        root_span.update_trace(input=trace_input)
+        trace_update = {
+            "input": trace_input,
+            "tags": identity.tags,
+            "metadata": metadata,
+        }
+        if session_id:
+            trace_update["session_id"] = session_id
+        if identity.user_id:
+            trace_update["user_id"] = identity.user_id
+        root_span.update_trace(**trace_update)
     except Exception as exc:
         _debug(f"update_trace(input) failed: {exc}")
 
@@ -1147,7 +1308,12 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
                     provider: str = "", base_url: str = "", api_mode: str = "",
                     api_call_count: int = 0, messages: Any = None, turn_type: str = "user",
                     conversation_history: Any = None, user_message: Any = None,
-                    turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
+                    turn_id: str = "", api_request_id: str = "",
+                    platform_user_id: str = "", sender_id: str = "",
+                    profile_name: str = "",
+                    environment_name: str = "", platform_chat_id: str = "",
+                    platform_thread_id: str = "", conversation_id: str = "",
+                    gateway_mode: str = "", **_: Any) -> None:
     # Older Hermes branches used pre_llm_call for request-scoped tracing and
     # passed the actual API messages. Current Hermes also has a turn-scoped
     # pre_llm_call used for context injection; tracing that hook creates an
@@ -1186,6 +1352,13 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
                 client=client,
                 turn_id=turn_id,
                 api_request_id=api_request_id,
+                platform_user_id=platform_user_id or sender_id,
+                profile_name=profile_name,
+                environment_name=environment_name,
+                platform_chat_id=platform_chat_id,
+                platform_thread_id=platform_thread_id,
+                conversation_id=conversation_id,
+                gateway_mode=gateway_mode,
             )
             _evict_stale_locked()
             _TRACE_STATE[task_key] = state
@@ -1287,6 +1460,13 @@ def on_pre_llm_request(
     api_request_id: str = "",
     request: Any = None,
     system_prompt: Any = None,
+    platform_user_id: str = "",
+    profile_name: str = "",
+    environment_name: str = "",
+    platform_chat_id: str = "",
+    platform_thread_id: str = "",
+    conversation_id: str = "",
+    gateway_mode: str = "",
     **_: Any,
 ) -> None:
     client = _get_langfuse()
@@ -1345,6 +1525,13 @@ def on_pre_llm_request(
                 client=client,
                 turn_id=turn_id,
                 api_request_id=api_request_id,
+                platform_user_id=platform_user_id,
+                profile_name=profile_name,
+                environment_name=environment_name,
+                platform_chat_id=platform_chat_id,
+                platform_thread_id=platform_thread_id,
+                conversation_id=conversation_id,
+                gateway_mode=gateway_mode,
             )
             _evict_stale_locked()
             _TRACE_STATE[task_key] = state

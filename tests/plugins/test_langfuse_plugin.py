@@ -216,6 +216,121 @@ class TestTraceScopeKey:
         assert "turn:turn-b" in key_b
 
 
+class TestTraceIdentity:
+    def _fresh_plugin(self):
+        mod_name = "plugins.observability.langfuse"
+        sys.modules.pop(mod_name, None)
+        return importlib.import_module(mod_name)
+
+    def test_profile_platform_and_user_form_stable_id(self):
+        plugin = self._fresh_plugin()
+
+        identity = plugin._build_trace_identity(
+            profile_name="Manager",
+            platform_name="Telegram",
+            platform_user_id="user_7",
+            environment_name="production",
+            session_id="session-1",
+            platform_chat_id="chat-1",
+            gateway_mode="native_gateway",
+        )
+
+        assert identity.user_id == "manager_telegram_user_7"
+        assert identity.tags == ["hermes", "langfuse", "telegram", "manager"]
+        assert identity.metadata["platform_user_id"] == "user_7"
+        assert identity.metadata["session_id"] == "session-1"
+
+    def test_components_are_not_pre_encoded_for_langfuse_urls(self):
+        plugin = self._fresh_plugin()
+
+        identity = plugin._build_trace_identity(
+            profile_name="user_example_com",
+            platform_name="api_server",
+            platform_user_id="user_7",
+        )
+
+        assert identity.user_id == "user_example_com_api_server_user_7"
+
+    def test_profile_route_is_api_user_identity(self):
+        plugin = self._fresh_plugin()
+
+        identity = plugin._build_trace_identity(
+            profile_name="user_example_com",
+            platform_name="api_server",
+            platform_user_id="",
+            gateway_mode="openai_compatible_api",
+        )
+
+        assert identity.user_id == "user_example_com_api_server"
+        assert identity.tags == [
+            "hermes",
+            "langfuse",
+            "api_server",
+            "user_example_com",
+        ]
+        assert identity.metadata["user_identity_source"] == "profile_route"
+
+    def test_missing_user_remains_unset_and_diagnosable(self):
+        plugin = self._fresh_plugin()
+
+        identity = plugin._build_trace_identity(
+            profile_name="manager",
+            platform_name="telegram",
+            platform_user_id="",
+        )
+
+        assert identity.user_id is None
+        assert identity.metadata["user_id_unset_reason"] == "platform_user_id_missing"
+        assert "manager" in identity.tags
+
+    def test_profile_identity_is_written_to_root_trace(self, monkeypatch):
+        plugin = self._fresh_plugin()
+        trace_updates = []
+
+        class RootSpan:
+            def update_trace(self, **kwargs):
+                trace_updates.append(kwargs)
+
+        root_span = RootSpan()
+
+        class RootContext:
+            def __enter__(self):
+                return root_span
+
+        class Client:
+            def create_trace_id(self, seed):
+                return "trace-id"
+
+            def start_as_current_observation(self, **kwargs):
+                return RootContext()
+
+        monkeypatch.setattr(plugin, "propagate_attributes", None)
+        plugin._start_root_trace(
+            "task-key",
+            task_id="task-id",
+            session_id="session-id",
+            platform="api_server",
+            provider="openai",
+            model="gpt-test",
+            api_mode="responses",
+            messages=[{"role": "user", "content": "hello"}],
+            client=Client(),
+            profile_name="user_example_com",
+            gateway_mode="openai_compatible_api",
+        )
+
+        assert trace_updates[0]["user_id"] == "user_example_com_api_server"
+        assert trace_updates[0]["tags"] == [
+            "hermes",
+            "langfuse",
+            "api_server",
+            "user_example_com",
+        ]
+        assert trace_updates[0]["metadata"]["profile_name"] == (
+            "user_example_com"
+        )
+
+
 # ---------------------------------------------------------------------------
 # End-to-end collision regression: two turns of ONE gateway session must not
 # share trace state.  The helper-level tests above prove _trace_key returns
@@ -1855,6 +1970,25 @@ class TestSystemPromptInGenerationInput:
         assert captured["input"][0]["role"] == "system"
         # window (12) + prepended system
         assert len(captured["input"]) == 13
+
+    def test_system_prompt_has_separate_size_limit(self, monkeypatch):
+        mod = self._make_mod()
+        monkeypatch.setenv("HERMES_LANGFUSE_MAX_CHARS", "10")
+        monkeypatch.setenv(
+            "HERMES_LANGFUSE_SYSTEM_PROMPT_MAX_CHARS",
+            "100",
+        )
+
+        messages = mod._messages_for_langfuse_input(
+            request_messages=[
+                {"role": "system", "content": "s" * 50},
+                {"role": "user", "content": "u" * 50},
+            ],
+        )
+
+        assert messages[0]["content"] == "s" * 50
+        assert messages[1]["content"].startswith("u" * 10)
+        assert "truncated 40 chars" in messages[1]["content"]
 
     def test_metadata_records_chars(self, monkeypatch):
         mod = self._make_mod()

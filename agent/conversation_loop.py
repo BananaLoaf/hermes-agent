@@ -2974,6 +2974,10 @@ def run_conversation(
                         system_prompt_for_hooks = _system_prompt_for_hooks(
                             api_kwargs, request_messages
                         )
+                        from agent.observability_context import (
+                            agent_observability_context,
+                        )
+
                         _invoke_hook(
                             "pre_api_request",
                             task_id=effective_task_id,
@@ -3001,6 +3005,7 @@ def run_conversation(
                             started_at=api_start_time,
                             middleware_trace=list(_llm_middleware_trace),
                             request=_request_payload,
+                            **agent_observability_context(agent),
                         )
                 except Exception:
                     pass

@@ -38,7 +38,9 @@ hermes chat -q "hello"              # then check Langfuse for a "Hermes turn" tr
 
 Generation observations include the Hermes system prompt when the provider
 uses a separate `system` param (Anthropic Messages API). Open an **LLM call**
-child span to inspect `role: system` (truncated via `HERMES_LANGFUSE_MAX_CHARS`).
+child span to inspect `role: system` (truncated via
+`HERMES_LANGFUSE_SYSTEM_PROMPT_MAX_CHARS`, falling back to
+`HERMES_LANGFUSE_MAX_CHARS`).
 
 ## Optional tuning
 
@@ -47,8 +49,11 @@ HERMES_LANGFUSE_ENV=production       # environment tag
 HERMES_LANGFUSE_RELEASE=v1.0.0       # release tag
 HERMES_LANGFUSE_SAMPLE_RATE=0.5      # sample 50% of traces
 HERMES_LANGFUSE_MAX_CHARS=12000      # max chars per field (default: 12000)
+HERMES_LANGFUSE_SYSTEM_PROMPT_MAX_CHARS=100000  # separate system prompt limit
 HERMES_LANGFUSE_CAPTURE=sanitized    # content capture mode (see below)
 HERMES_LANGFUSE_DEBUG=true           # verbose plugin logging
+LANGFUSE_TIMEOUT=30                  # OTLP request timeout in seconds
+LANGFUSE_FLUSH_AT=10                 # maximum spans per export batch
 ```
 
 ## Capture modes

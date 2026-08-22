@@ -194,7 +194,10 @@ hermes chat -q "hello"              # check the Langfuse UI for a "Hermes turn" 
 | `HERMES_LANGFUSE_RELEASE` | — | Release/version tag |
 | `HERMES_LANGFUSE_SAMPLE_RATE` | `1.0` | Sampling rate passed to the SDK (0.0–1.0) |
 | `HERMES_LANGFUSE_MAX_CHARS` | `12000` | Per-field truncation for message content / tool args / tool results |
+| `HERMES_LANGFUSE_SYSTEM_PROMPT_MAX_CHARS` | `HERMES_LANGFUSE_MAX_CHARS` | Separate truncation limit for the system prompt |
 | `HERMES_LANGFUSE_DEBUG` | `false` | Verbose plugin logging to `agent.log` |
+| `LANGFUSE_TIMEOUT` | `5` | Standard SDK OTLP request timeout in seconds |
+| `LANGFUSE_FLUSH_AT` | `512` | Standard SDK maximum spans per export batch |
 
 Hermes-prefixed and standard SDK env vars (`LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL`) are both accepted — Hermes-prefixed wins when both are set.
 

@@ -214,7 +214,10 @@ Environment variables for the bundled [`observability/langfuse`](/user-guide/fea
 | `HERMES_LANGFUSE_RELEASE` | Release/version tag on traces |
 | `HERMES_LANGFUSE_SAMPLE_RATE` | SDK sampling rate 0.0–1.0 (default: `1.0`) |
 | `HERMES_LANGFUSE_MAX_CHARS` | Per-field truncation for serialized payloads (default: `12000`) |
+| `HERMES_LANGFUSE_SYSTEM_PROMPT_MAX_CHARS` | Separate system-prompt truncation limit (defaults to `HERMES_LANGFUSE_MAX_CHARS`) |
 | `HERMES_LANGFUSE_DEBUG` | `true` enables verbose plugin logging to `agent.log` |
+| `LANGFUSE_TIMEOUT` | Standard Langfuse SDK OTLP request timeout in seconds (default: `5`) |
+| `LANGFUSE_FLUSH_AT` | Standard Langfuse SDK maximum spans per export batch (default: `512`) |
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL` | Standard Langfuse SDK names. Accepted as fallbacks when the `HERMES_LANGFUSE_*` equivalents are unset. |
 
 ### Nous Tool Gateway

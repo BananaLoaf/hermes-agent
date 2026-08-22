@@ -314,11 +314,14 @@ _EXTRA_ENV_KEYS = frozenset({
     "HERMES_LANGFUSE_RELEASE",
     "HERMES_LANGFUSE_SAMPLE_RATE",
     "HERMES_LANGFUSE_MAX_CHARS",
+    "HERMES_LANGFUSE_SYSTEM_PROMPT_MAX_CHARS",
     "HERMES_LANGFUSE_CAPTURE",
     "HERMES_LANGFUSE_DEBUG",
     "LANGFUSE_PUBLIC_KEY",
     "LANGFUSE_SECRET_KEY",
     "LANGFUSE_BASE_URL",
+    "LANGFUSE_TIMEOUT",
+    "LANGFUSE_FLUSH_AT",
     # ACP (Agent Client Protocol) keys — profile-isolable so different
     # profiles can use different ACP backends without cross-leak.
     "HERMES_ACP_AUTH_METHOD",
