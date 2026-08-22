@@ -102,17 +102,42 @@ COMPACTION_STATUS = (
 )
 
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
+COMPACTION_FAILED_STATUS = "⚠ Context compaction did not complete — continuing turn..."
 
 
-def _emit_compaction_done(agent: Any) -> None:
-    """Emit the structured terminal edge for a started compaction."""
-    status_callback = getattr(agent, "status_callback", None)
-    if not status_callback:
+def _emit_compaction_event(
+    agent: Any,
+    phase: str,
+    message: str,
+    *,
+    error: bool = False,
+) -> None:
+    """Emit a semantic compaction lifecycle event for structured clients."""
+    callback = getattr(agent, "compaction_callback", None)
+    if not callback:
         return
     try:
-        status_callback("compacted", COMPACTION_DONE_STATUS)
+        callback(phase, {"message": message, "error": error})
     except Exception:
-        logger.debug("status_callback error in compaction completion", exc_info=True)
+        logger.debug("compaction_callback error", exc_info=True)
+
+
+def _emit_compaction_done(agent: Any, *, succeeded: bool) -> None:
+    """Emit the terminal edge for a started compaction."""
+    event_type = "compacted" if succeeded else "compaction_failed"
+    message = COMPACTION_DONE_STATUS if succeeded else COMPACTION_FAILED_STATUS
+    status_callback = getattr(agent, "status_callback", None)
+    if status_callback:
+        try:
+            status_callback(event_type, message)
+        except Exception:
+            logger.debug("status_callback error in compaction completion", exc_info=True)
+    _emit_compaction_event(
+        agent,
+        "completed" if succeeded else "failed",
+        message,
+        error=not succeeded,
+    )
 
 
 # ── Routine compression status templates ────────────────────────────────────
@@ -2413,7 +2438,9 @@ def compress_context(
     _compaction_status_emitted = bool(_compaction_status)
     if _compaction_status:
         agent._emit_status(_compaction_status)
+        _emit_compaction_event(agent, "started", _compaction_status)
     _compaction_done_emitted = False
+    _compaction_succeeded = False
 
     def _complete_compaction_lifecycle() -> None:
         nonlocal _compaction_done_emitted
@@ -2424,7 +2451,7 @@ def compress_context(
         # compaction phase — emit no terminal edge either. Failure warnings
         # go through agent._emit_warning and are never suppressed here.
         if _compaction_status_emitted:
-            _emit_compaction_done(agent)
+            _emit_compaction_done(agent, succeeded=_compaction_succeeded)
 
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
@@ -3951,6 +3978,7 @@ def compress_context(
             f"{_compressed_est:,}",
         )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
+        _compaction_succeeded = _commit_status == "committed"
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,
@@ -4033,17 +4061,18 @@ def _compress_context_via_codex_app_server(
     )
     try:
         agent._emit_status(COMPACTION_STATUS)
+        _emit_compaction_event(agent, "started", COMPACTION_STATUS)
     except Exception:
         pass
 
     _compaction_done_emitted = False
 
-    def _complete_compaction_lifecycle() -> None:
+    def _complete_compaction_lifecycle(*, succeeded: bool) -> None:
         nonlocal _compaction_done_emitted
         if _compaction_done_emitted:
             return
         _compaction_done_emitted = True
-        _emit_compaction_done(agent)
+        _emit_compaction_done(agent, succeeded=succeeded)
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     try:
@@ -4052,7 +4081,7 @@ def _compress_context_via_codex_app_server(
     except BaseException:
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression failed")
-        _complete_compaction_lifecycle()
+        _complete_compaction_lifecycle(succeeded=False)
         raise
 
     if getattr(result, "interrupted", False) or getattr(result, "error", None):
@@ -4077,7 +4106,7 @@ def _compress_context_via_codex_app_server(
         existing_prompt = getattr(agent, "_cached_system_prompt", None)
         if not existing_prompt:
             existing_prompt = agent._build_system_prompt(system_message)
-        _complete_compaction_lifecycle()
+        _complete_compaction_lifecycle(succeeded=False)
         return messages, existing_prompt
 
     try:
@@ -4117,7 +4146,7 @@ def _compress_context_via_codex_app_server(
     existing_prompt = getattr(agent, "_cached_system_prompt", None)
     if not existing_prompt:
         existing_prompt = agent._build_system_prompt(system_message)
-    _complete_compaction_lifecycle()
+    _complete_compaction_lifecycle(succeeded=True)
     return messages, existing_prompt
 
 
@@ -4411,6 +4440,7 @@ def try_shrink_image_parts_in_messages(
 __all__ = [
     "COMPACTION_STATUS",
     "COMPACTION_DONE_STATUS",
+    "COMPACTION_FAILED_STATUS",
     "COMPACTION_STATUS_MARKER",
     "check_compression_model_feasibility",
     "replay_compression_warning",

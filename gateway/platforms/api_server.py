@@ -3,7 +3,7 @@ OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
 - POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
-- POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id or X-Hermes-Session-Id; X-Hermes-Session-Key supported)
+- POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id or X-Hermes-Session-Id; X-Hermes-Session-Key and opt-in X-Hermes-Events supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
@@ -2686,6 +2686,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        compaction_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -3013,6 +3014,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
+            "compaction_callback": compaction_callback,
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
@@ -3228,6 +3230,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions_streaming": True,
                 "responses_api": True,
                 "responses_streaming": True,
+                "compaction_status_events": True,
                 "run_submission": True,
                 "run_status": True,
                 "run_events_sse": True,
@@ -3250,6 +3253,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
+                "extension_events_header": "X-Hermes-Events",
                 "cors": bool(self._cors_origins),
             },
             "endpoints": {
@@ -4783,6 +4787,8 @@ class APIServerAdapter(BasePlatformAdapter):
           response object with all output items + usage (same payload
           shape as the non-streaming path for parity)
         - ``response.failed`` — terminal event on agent error
+        - opt-in ``hermes.context_compaction`` — transient compression
+          lifecycle for clients that send ``X-Hermes-Events: compaction``
 
         If the client disconnects mid-stream, ``agent.interrupt()`` is
         called so the agent stops issuing upstream LLM calls, then the
@@ -5059,15 +5065,38 @@ class APIServerAdapter(BasePlatformAdapter):
                     "item": output_item,
                 })
 
+            async def _emit_compaction_status(payload: Dict[str, Any]) -> None:
+                """Emit an opt-in transient status understood by Open WebUI.
+
+                The nested event uses Open WebUI's existing status-event
+                contract. It is deliberately absent from Responses output and
+                persistence, so strict clients and model-visible history stay
+                OpenAI-compatible.
+                """
+                event_data = {
+                    "action": "context_compaction",
+                    "description": payload.get("message", ""),
+                    "done": bool(payload.get("done")),
+                }
+                if payload.get("error"):
+                    event_data["error"] = True
+                await _write_event("hermes.context_compaction", {
+                    "type": "hermes.context_compaction",
+                    "event": {
+                        "type": "context_compaction",
+                        "data": event_data,
+                    },
+                })
+
             # Main drain loop — thread-safe queue fed by agent callbacks.
             async def _dispatch(it) -> None:
                 """Route a queue item to the correct SSE emitter.
 
                 Plain strings are text deltas — they are batched (50ms)
                 to reduce Open WebUI re-render storms.  Tagged tuples
-                with ``__tool_started__`` / ``__tool_completed__``
-                prefixes are tool lifecycle events and flush the buffer
-                before emitting.
+                with ``__tool_started__`` / ``__tool_completed__`` /
+                ``__compaction_status__`` prefixes are lifecycle events and
+                flush the buffer before emitting.
                 """
                 nonlocal _batch_timer
                 if isinstance(it, tuple) and len(it) == 2 and isinstance(it[0], str):
@@ -5079,6 +5108,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_tool_started(payload)
                     elif tag == "__tool_completed__":
                         await _emit_tool_completed(payload)
+                    elif tag == "__compaction_status__":
+                        await _emit_compaction_status(payload)
                 elif isinstance(it, str):
                     # Batch text deltas — append to buffer, flush on timer
                     _batch_buf.append(it)
@@ -5494,6 +5525,13 @@ class APIServerAdapter(BasePlatformAdapter):
             # agent runs so frontends can render text deltas and tool
             # calls in real time.  See _write_sse_responses for details.
             _stream_q = ThreadSafeAsyncQueue()
+            requested_hermes_events = {
+                event.strip().lower()
+                for event in request.headers.get("X-Hermes-Events", "").split(",")
+                if event.strip()
+            }
+            emit_compaction_status = "compaction" in requested_hermes_events
+            compaction_status_active = False
 
             def _on_delta(delta):
                 # None from the agent is a CLI box-close signal, not EOS.
@@ -5530,6 +5568,36 @@ class APIServerAdapter(BasePlatformAdapter):
                     "result": function_result,
                 }))
 
+            def _on_compaction(phase, payload):
+                """Bridge semantic compaction lifecycle into an opt-in SSE event."""
+                nonlocal compaction_status_active
+                if not emit_compaction_status:
+                    return
+
+                data = payload if isinstance(payload, dict) else {}
+                text = str(data.get("message") or "").strip()
+                if phase in {"completed", "failed"}:
+                    if not compaction_status_active:
+                        return
+                    compaction_status_active = False
+                    _stream_q.put_threadsafe(("__compaction_status__", {
+                        "message": text,
+                        "done": True,
+                        "error": phase == "failed" or bool(data.get("error")),
+                    }))
+                    return
+
+                if phase != "started":
+                    return
+                if compaction_status_active:
+                    return
+                compaction_status_active = True
+                _stream_q.put_threadsafe(("__compaction_status__", {
+                    "message": text,
+                    "done": False,
+                    "error": False,
+                }))
+
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -5537,6 +5605,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                compaction_callback=_on_compaction,
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
@@ -6354,6 +6423,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        compaction_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -6419,6 +6489,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=stream_delta_callback,
+                        compaction_callback=compaction_callback,
                         tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback,
                         tool_complete_callback=tool_complete_callback,

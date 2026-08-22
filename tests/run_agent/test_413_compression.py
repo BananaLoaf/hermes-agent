@@ -16,7 +16,11 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.context_compressor import SUMMARY_PREFIX
-from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
+from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
+    COMPACTION_FAILED_STATUS,
+    COMPACTION_STATUS,
+)
 from run_agent import AIAgent
 import run_agent
 
@@ -450,7 +454,11 @@ class TestPreflightCompression:
         # test asserts, so disable it to suppress the probe.
         agent.compression_enabled = False
         events = []
+        compaction_events = []
         agent.status_callback = lambda ev, msg: events.append((ev, msg))
+        agent.compaction_callback = lambda phase, payload: compaction_events.append(
+            (phase, payload)
+        )
 
         def _fake_compress(
             messages,
@@ -488,6 +496,9 @@ class TestPreflightCompression:
             ("compress", "started"),
             ("compacted", COMPACTION_DONE_STATUS),
         ]
+        assert [phase for phase, _ in compaction_events] == ["started", "completed"]
+        assert compaction_events[0][1]["message"] == COMPACTION_STATUS
+        assert compaction_events[-1][1]["error"] is False
 
     def test_compress_context_emits_one_terminal_status_when_lock_is_unavailable(self, agent):
         """A rejected lock must retire the started desktop compaction phase."""
@@ -498,15 +509,56 @@ class TestPreflightCompression:
             try_acquire_compression_lock=lambda *_args, **_kwargs: False,
         )
         events = []
+        compaction_events = []
         agent.status_callback = lambda event, message: events.append((event, message))
+        agent.compaction_callback = lambda phase, payload: compaction_events.append(
+            (phase, payload)
+        )
         messages = [{"role": "user", "content": "hello"}]
 
         compressed, prompt = agent._compress_context(messages, "system prompt", force=True)
 
         assert compressed is messages
         assert prompt == "You are helpful."
-        assert [event for event, _ in events] == ["lifecycle", "warn", "compacted"]
-        assert events[-1] == ("compacted", COMPACTION_DONE_STATUS)
+        assert [event for event, _ in events] == [
+            "lifecycle",
+            "warn",
+            "compaction_failed",
+        ]
+        assert events[-1] == ("compaction_failed", COMPACTION_FAILED_STATUS)
+        assert [phase for phase, _ in compaction_events] == ["started", "failed"]
+        assert compaction_events[-1][1]["error"] is True
+
+    def test_compaction_callback_does_not_depend_on_status_text(self, agent):
+        """Structured clients receive phases even when an engine customizes text."""
+        agent.compression_enabled = False
+        custom_status = "Custom context maintenance is running"
+        agent.context_compressor.get_automatic_compaction_status_message = (
+            lambda **_kwargs: custom_status
+        )
+        compaction_events = []
+        agent.compaction_callback = lambda phase, payload: compaction_events.append(
+            (phase, payload)
+        )
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "compress",
+                return_value=[
+                    {"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}
+                ],
+            ),
+            patch("run_agent.estimate_request_tokens_rough", return_value=42),
+        ):
+            agent._compress_context(
+                [{"role": "user", "content": "hello"}],
+                "system prompt",
+                approx_tokens=1234,
+            )
+
+        assert [phase for phase, _ in compaction_events] == ["started", "completed"]
+        assert compaction_events[0][1]["message"] == custom_status
 
 
     def test_compression_reuses_cached_prompt_when_memory_snapshot_is_unchanged(self, agent):
