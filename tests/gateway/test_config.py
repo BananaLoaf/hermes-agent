@@ -87,9 +87,9 @@ class TestPlatformConfigRoundtrip:
     def test_typing_status_text_resolved_from_extra(self):
         # Same bridge route as typing_indicator: the shared-key loop copies a
         # nested platforms.<plat> value into extra.
-        restored = PlatformConfig.from_dict(
-            {"extra": {"typing_status_text": "chasing yarn…"}}
-        )
+        restored = PlatformConfig.from_dict({
+            "extra": {"typing_status_text": "chasing yarn…"}
+        })
         assert restored.typing_status_text == "chasing yarn…"
 
 
@@ -126,13 +126,11 @@ class TestChannelOverride:
 
 class TestPlatformConfigMalformedSections:
     def test_from_dict_ignores_malformed_nested_sections(self):
-        restored = PlatformConfig.from_dict(
-            {
-                "enabled": True,
-                "home_channel": "telegram:123",
-                "extra": "oops",
-            }
-        )
+        restored = PlatformConfig.from_dict({
+            "enabled": True,
+            "home_channel": "telegram:123",
+            "extra": "oops",
+        })
 
         assert restored.enabled is True
         assert restored.home_channel is None
@@ -179,7 +177,6 @@ class TestSessionResetPolicy:
         assert restored.idle_minutes == 120
         assert restored.bg_process_max_age_hours == 48
 
-
     def test_from_dict_treats_null_values_as_defaults(self):
         restored = SessionResetPolicy.from_dict(
             {"mode": None, "at_hour": None, "idle_minutes": None,
@@ -195,13 +192,11 @@ class TestStreamingConfig:
 
 
     def test_from_dict_malformed_numeric_values_fall_back_to_defaults(self):
-        restored = StreamingConfig.from_dict(
-            {
-                "edit_interval": "oops",
-                "buffer_threshold": "oops",
-                "fresh_final_after_seconds": "oops",
-            }
-        )
+        restored = StreamingConfig.from_dict({
+            "edit_interval": "oops",
+            "buffer_threshold": "oops",
+            "fresh_final_after_seconds": "oops",
+        })
         assert restored.edit_interval == 0.8
         assert restored.buffer_threshold == 24
         assert restored.fresh_final_after_seconds == 0.0
@@ -529,7 +524,7 @@ class TestLoadGatewayConfig:
 
     def test_api_server_port_bridged_into_extra(self, tmp_path, monkeypatch):
         """``gateway.api_server.port`` must land in PlatformConfig.extra —
-        the adapter reads port/key/host/cors_origins/model_name from extra
+        the adapter reads its platform-specific settings from extra
         (gateway/platforms/api_server.py), and from_dict discards unknown
         top-level keys, so without the bridge the port is silently lost."""
         self._clear_api_server_env(monkeypatch)
@@ -542,7 +537,11 @@ class TestLoadGatewayConfig:
             "    port: 8642\n"
             "    host: 0.0.0.0\n"
             "    key: sekrit\n"
-            "    model_name: my-hermes\n",
+            "    model_name: my-hermes\n"
+            "    outbound_files:\n"
+            "      provider: zipline\n"
+            "      base_url: https://files.example.com\n"
+            "      api_key: zipline-key\n",
             encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -554,6 +553,11 @@ class TestLoadGatewayConfig:
         assert extra["host"] == "0.0.0.0"
         assert extra["key"] == "sekrit"
         assert extra["model_name"] == "my-hermes"
+        assert extra["outbound_files"] == {
+            "provider": "zipline",
+            "base_url": "https://files.example.com",
+            "api_key": "zipline-key",
+        }
 
 
     def test_non_platform_gateway_keys_not_misparsed_as_platforms(self, tmp_path, monkeypatch):

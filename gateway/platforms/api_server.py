@@ -95,6 +95,7 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.outbound_files import OutboundFileExporter, OutboundMediaStreamBuffer
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -251,9 +252,16 @@ _REQUEST_OPTION_MISSING = object()
 # transports/profiles via agent.reasoning_effort. Rejecting "max"/"ultra"
 # here made API/browser clients second-class citizens of the ladder
 # (#78216's api_server observation).
-_REASONING_EFFORTS = frozenset(
-    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
-)
+_REASONING_EFFORTS = frozenset({
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+})
 _RUNTIME_AGENT_OVERRIDE_KEYS = (
     "api_key",
     "base_url",
@@ -1021,6 +1029,7 @@ if AIOHTTP_AVAILABLE:
         if cors_headers is not None:
             response.headers.update(cors_headers)
         return response
+
 else:
     cors_middleware = None  # type: ignore[assignment]
 
@@ -1190,6 +1199,7 @@ if AIOHTTP_AVAILABLE:
                 _openai_error("Request body too large.", code="body_too_large"),
                 status=413,
             )
+
 else:
     body_limit_middleware = None  # type: ignore[assignment]
 
@@ -1212,6 +1222,7 @@ if AIOHTTP_AVAILABLE:
         for k, v in _SECURITY_HEADERS.items():
             response.headers.setdefault(k, v)
         return response
+
 else:
     security_headers_middleware = None  # type: ignore[assignment]
 
@@ -1383,6 +1394,9 @@ class APIServerAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
+        self._outbound_files = OutboundFileExporter.from_dict(
+            extra.get("outbound_files")
+        )
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
         raw_port = extra.get("port")
         if raw_port is None:
@@ -1483,6 +1497,47 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+
+    async def _export_outbound_media(
+        self,
+        text: str,
+        *,
+        exported_paths: Optional[Dict[str, str]] = None,
+    ) -> str:
+        if self._outbound_files is None:
+            return _resolve_media_to_data_urls(text)
+        return await self._outbound_files.export_media_text(
+            text,
+            exported_paths=exported_paths,
+        )
+
+    async def _export_transcript_media(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        raw_final_response: Optional[str] = None,
+        exported_final_response: Optional[str] = None,
+        exported_paths: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return an egress-safe transcript without mutating agent state."""
+        exported: List[Dict[str, Any]] = []
+        for message in messages:
+            safe_message = dict(message)
+            content = safe_message.get("content")
+            if isinstance(content, str):
+                if (
+                    raw_final_response is not None
+                    and exported_final_response is not None
+                    and content == raw_final_response
+                ):
+                    safe_message["content"] = exported_final_response
+                else:
+                    safe_message["content"] = await self._export_outbound_media(
+                        content,
+                        exported_paths=exported_paths,
+                    )
+            exported.append(safe_message)
+        return exported
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -3048,9 +3103,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
-        return web.json_response(
-            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
-        )
+        return web.json_response({
+            "status": "ok",
+            "platform": "hermes-agent",
+            "version": _hermes_version(),
+        })
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
         """GET /health/detailed — rich status for cross-container dashboard probing.
@@ -3266,7 +3323,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
-                "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
+                "run_approval": {
+                    "method": "POST",
+                    "path": "/v1/runs/{run_id}/approval",
+                },
                 "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
@@ -3274,13 +3334,34 @@ class APIServerAdapter(BasePlatformAdapter):
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
-                "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
-                "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
-                "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
-                "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
-                "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
-                "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
-                "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
+                "session_update": {
+                    "method": "PATCH",
+                    "path": "/api/sessions/{session_id}",
+                },
+                "session_delete": {
+                    "method": "DELETE",
+                    "path": "/api/sessions/{session_id}",
+                },
+                "session_messages": {
+                    "method": "GET",
+                    "path": "/api/sessions/{session_id}/messages",
+                },
+                "session_fork": {
+                    "method": "POST",
+                    "path": "/api/sessions/{session_id}/fork",
+                },
+                "session_chat": {
+                    "method": "POST",
+                    "path": "/api/sessions/{session_id}/chat",
+                },
+                "session_chat_stream": {
+                    "method": "POST",
+                    "path": "/api/sessions/{session_id}/chat/stream",
+                },
+                "session_model_lock": {
+                    "method": "POST",
+                    "path": "/api/sessions/{session_id}/model",
+                },
             },
         })
 
@@ -3593,28 +3674,50 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_row = conn.execute(
                     "SELECT * FROM sessions WHERE id = ?", (session_id,)
                 ).fetchone()
-                return (dict(session_row) if session_row else {
-                    "id": session_id, "source": source,
-                    "model": model_name, "title": title,
-                }), None
+                return (
+                    dict(session_row)
+                    if session_row
+                    else {
+                        "id": session_id,
+                        "source": source,
+                        "model": model_name,
+                        "title": title,
+                    }
+                ), None
+
             return db._execute_write(_atomic)
 
         session, err = await asyncio.to_thread(_do_create)
         if err == "exists":
-            return web.json_response(_openai_error(f"Session already exists: {session_id}", code="session_exists"), status=409)
+            return web.json_response(
+                _openai_error(
+                    f"Session already exists: {session_id}", code="session_exists"
+                ),
+                status=409,
+            )
         if err and err.startswith("title:"):
-            return web.json_response(_openai_error(err[len("title:"):], code="invalid_title"), status=400)
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)}, status=201)
+            return web.json_response(
+                _openai_error(err[len("title:") :], code="invalid_title"), status=400
+            )
+        return web.json_response(
+            {"object": "hermes.session", "session": self._session_response(session)},
+            status=201,
+        )
 
     async def _handle_get_session(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions/{session_id}."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-        session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
+        session, err = await self._get_existing_session_or_404(
+            request.match_info["session_id"]
+        )
         if err:
             return err
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        return web.json_response({
+            "object": "hermes.session",
+            "session": self._session_response(session),
+        })
 
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
@@ -3636,32 +3739,61 @@ class APIServerAdapter(BasePlatformAdapter):
         allowed = {"title", "end_reason", "pinned", "archived", "hidden", "unread"}
         unknown = sorted(set(body) - allowed)
         if unknown:
-            return web.json_response(_openai_error(f"Unsupported session fields: {', '.join(unknown)}", code="unsupported_session_field"), status=400)
+            return web.json_response(
+                _openai_error(
+                    f"Unsupported session fields: {', '.join(unknown)}",
+                    code="unsupported_session_field",
+                ),
+                status=400,
+            )
 
         for flag in ("pinned", "archived", "hidden", "unread"):
             if flag in body and not isinstance(body[flag], bool):
-                return web.json_response(_openai_error(f"'{flag}' must be a boolean", code="invalid_session_field"), status=400)
+                return web.json_response(
+                    _openai_error(
+                        f"'{flag}' must be a boolean", code="invalid_session_field"
+                    ),
+                    status=400,
+                )
 
         db = await self._ensure_session_db_async()
         if db is None:
-            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable", code="session_db_unavailable"
+                ),
+                status=503,
+            )
         if "title" in body:
             try:
-                await asyncio.to_thread(db.set_session_title, session_id, "" if body["title"] is None else str(body["title"]))
+                await asyncio.to_thread(
+                    db.set_session_title,
+                    session_id,
+                    "" if body["title"] is None else str(body["title"]),
+                )
             except ValueError as exc:
-                return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
+                return web.json_response(
+                    _openai_error(str(exc), code="invalid_title"), status=400
+                )
         if "pinned" in body:
             await asyncio.to_thread(db.set_session_pinned, session_id, body["pinned"])
         if "archived" in body:
-            await asyncio.to_thread(db.set_session_archived, session_id, body["archived"])
+            await asyncio.to_thread(
+                db.set_session_archived, session_id, body["archived"]
+            )
         if "hidden" in body:
             await asyncio.to_thread(db.set_session_hidden, session_id, body["hidden"])
         if "unread" in body:
-            await asyncio.to_thread(db.set_session_read, session_id, read=not body["unread"])
+            await asyncio.to_thread(
+                db.set_session_read, session_id, read=not body["unread"]
+            )
         if body.get("end_reason"):
             await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
         session = await asyncio.to_thread(db.get_session, session_id) or session
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        return web.json_response({
+            "object": "hermes.session",
+            "session": self._session_response(session),
+        })
 
     async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
         """DELETE /api/sessions/{session_id}."""
@@ -3674,7 +3806,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return err
         db = await self._ensure_session_db_async()
         deleted = await asyncio.to_thread(db.delete_session, session_id)
-        return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
+        return web.json_response({
+            "object": "hermes.session.deleted",
+            "id": session_id,
+            "deleted": bool(deleted),
+        })
 
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions/{session_id}/messages."""
@@ -3866,8 +4002,12 @@ class APIServerAdapter(BasePlatformAdapter):
             confirmed_runtime_lock=lock_active,
             **agent_overrides,
         )
-        effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        effective_session_id = (
+            result.get("session_id") if isinstance(result, dict) else session_id
+        )
+        final_response = await self._export_outbound_media(
+            result.get("final_response", "") if isinstance(result, dict) else ""
+        )
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -3979,6 +4119,11 @@ class APIServerAdapter(BasePlatformAdapter):
             model=body.get("model", self._model_name),
         )
         seq = 0
+        media_buffer = (
+            OutboundMediaStreamBuffer() if self._outbound_files is not None else None
+        )
+        media_exports: Dict[str, str] = {}
+        media_delta_queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
             nonlocal seq
@@ -4004,8 +4149,36 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
         def _delta(delta: str) -> None:
-            if delta:
-                _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
+            if not delta:
+                return
+            if media_buffer is None:
+                _enqueue(
+                    "assistant.delta",
+                    {"message_id": message_id, "delta": delta},
+                )
+                return
+            try:
+                loop.call_soon_threadsafe(media_delta_queue.put_nowait, delta)
+            except RuntimeError:
+                pass
+
+        async def _stream_media_deltas() -> None:
+            while True:
+                delta = await media_delta_queue.get()
+                if delta is None:
+                    return
+                content = media_buffer.feed(delta)
+                if not content:
+                    continue
+                if "MEDIA:" in content:
+                    content = await self._export_outbound_media(
+                        content,
+                        exported_paths=media_exports,
+                    )
+                _enqueue(
+                    "assistant.delta",
+                    {"message_id": message_id, "delta": content},
+                )
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
@@ -4015,6 +4188,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
         async def _run_and_signal() -> None:
+            media_delta_task = (
+                asyncio.create_task(_stream_media_deltas())
+                if media_buffer is not None
+                else None
+            )
             try:
                 await queue.put(_event_payload("run.started", {
                     "user_message": {"role": "user", "content": user_message},
@@ -4039,9 +4217,48 @@ class APIServerAdapter(BasePlatformAdapter):
                     confirmed_runtime_lock=lock_active,
                     **agent_overrides,
                 )
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
-                effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
-                turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
+                raw_final_response = (
+                    result.get("final_response", "") if isinstance(result, dict) else ""
+                )
+                if media_buffer is not None:
+                    await media_delta_queue.put(None)
+                    await media_delta_task
+                    media_tail = media_buffer.finish(raw_final_response)
+                    if media_tail:
+                        rendered_tail = await self._export_outbound_media(
+                            media_tail,
+                            exported_paths=media_exports,
+                        )
+                        _enqueue(
+                            "assistant.delta",
+                            {
+                                "message_id": message_id,
+                                "delta": rendered_tail,
+                            },
+                        )
+                    final_response = await self._export_outbound_media(
+                        raw_final_response,
+                        exported_paths=media_exports,
+                    )
+                else:
+                    final_response = await self._export_outbound_media(
+                        raw_final_response
+                    )
+                effective_session_id = (
+                    result.get("session_id", session_id)
+                    if isinstance(result, dict)
+                    else session_id
+                )
+                turn_messages = (
+                    await self._export_transcript_media(
+                        self._turn_transcript_messages(history, user_message, result),
+                        raw_final_response=raw_final_response,
+                        exported_final_response=final_response,
+                        exported_paths=media_exports,
+                    )
+                    if isinstance(result, dict)
+                    else []
+                )
                 effective_runtime = {}
                 if isinstance(result, dict):
                     effective_runtime = result.get("runtime") or {}
@@ -4105,6 +4322,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
+                if media_delta_task is not None and not media_delta_task.done():
+                    media_delta_task.cancel()
                 self._active_run_agents.pop(run_id, None)
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
@@ -4222,6 +4441,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "runtime": runtime,
         })
+
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -4385,16 +4605,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     return
                 _started_tool_call_ids.add(tool_call_id)
                 from agent.display import build_tool_preview, get_tool_emoji
-                label = build_tool_preview(function_name, function_args) or function_name
-                _stream_q.put_threadsafe(("__tool_progress__", {
-                    "tool": function_name,
-                    "emoji": get_tool_emoji(function_name),
-                    "label": label,
-                    "toolCallId": tool_call_id,
-                    "status": "running",
-                }))
 
-            def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+                label = (
+                    build_tool_preview(function_name, function_args) or function_name
+                )
+                _stream_q.put_threadsafe((
+                    "__tool_progress__",
+                    {
+                        "tool": function_name,
+                        "emoji": get_tool_emoji(function_name),
+                        "label": label,
+                        "toolCallId": tool_call_id,
+                        "status": "running",
+                    },
+                ))
+
+            def _on_tool_complete(
+                tool_call_id, function_name, function_args, function_result
+            ):
                 """Emit the matching ``status: completed`` event.
 
                 Dropped if the start was filtered (internal tool, missing
@@ -4404,11 +4632,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put_threadsafe(("__tool_progress__", {
-                    "tool": function_name,
-                    "toolCallId": tool_call_id,
-                    "status": "completed",
-                }))
+                _stream_q.put_threadsafe((
+                    "__tool_progress__",
+                    {
+                        "tool": function_name,
+                        "toolCallId": tool_call_id,
+                        "status": "completed",
+                    },
+                ))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -4478,7 +4709,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        final_response = await self._export_outbound_media(
+            result.get("final_response") or ""
+        )
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -4586,6 +4819,10 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
+        media_buffer = (
+            OutboundMediaStreamBuffer() if self._outbound_files is not None else None
+        )
+        media_exports: Dict[str, str] = {}
 
         try:
             last_activity = time.monotonic()
@@ -4599,6 +4836,24 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(_sse_frame(role_chunk))
             last_activity = time.monotonic()
 
+            async def _write_content(content: str) -> None:
+                if not content:
+                    return
+                content_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": content},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                await response.write(_sse_frame(content_chunk))
+
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
                 """Write a single queue item to the SSE stream.
@@ -4610,15 +4865,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
-                    await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
+                if (
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and item[0] == "__tool_progress__"
+                ):
+                    await response.write(
+                        _sse_frame(item[1], event="hermes.tool.progress")
+                    )
                 else:
-                    content_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
-                    }
-                    await response.write(_sse_frame(content_chunk))
+                    content = (
+                        media_buffer.feed(item) if media_buffer is not None else item
+                    )
+                    if content and "MEDIA:" in content:
+                        content = await self._export_outbound_media(
+                            content,
+                            exported_paths=media_exports,
+                        )
+                    await _write_content(content)
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent. Woken
@@ -4678,6 +4942,19 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
+
+            if media_buffer is not None:
+                authoritative_text = (
+                    result.get("final_response", "") if isinstance(result, dict) else ""
+                )
+                media_tail = media_buffer.finish(authoritative_text)
+                if media_tail:
+                    await _write_content(
+                        await self._export_outbound_media(
+                            media_tail,
+                            exported_paths=media_exports,
+                        )
+                    )
 
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.
@@ -4814,6 +5091,10 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
+        media_buffer = (
+            OutboundMediaStreamBuffer() if self._outbound_files is not None else None
+        )
+        media_exports: Dict[str, str] = {}
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
@@ -4870,13 +5151,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 return
             if conversation_history_snapshot is None:
                 conversation_history_snapshot = list(conversation_history)
-                conversation_history_snapshot.append({"role": "user", "content": user_message})
-            self._response_store.put(response_id, {
-                "response": response_env,
-                "conversation_history": conversation_history_snapshot,
-                "instructions": instructions,
-                "session_id": session_id_snapshot or session_id,
-            })
+                conversation_history_snapshot.append({
+                    "role": "user",
+                    "content": user_message,
+                })
+            self._response_store.put(
+                response_id,
+                {
+                    "response": response_env,
+                    "conversation_history": conversation_history_snapshot,
+                    "instructions": instructions,
+                    "session_id": session_id_snapshot or session_id,
+                },
+            )
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
 
@@ -4908,7 +5195,10 @@ class APIServerAdapter(BasePlatformAdapter):
             incomplete_history = list(conversation_history)
             incomplete_history.append({"role": "user", "content": user_message})
             if incomplete_text:
-                incomplete_history.append({"role": "assistant", "content": incomplete_text})
+                incomplete_history.append({
+                    "role": "assistant",
+                    "content": incomplete_text,
+                })
             _persist_response_snapshot(
                 incomplete_env,
                 conversation_history_snapshot=incomplete_history,
@@ -4998,11 +5288,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     "arguments": arguments_str,
                     "call_id": call_id,
                 })
-                await _write_event("response.output_item.added", {
-                    "type": "response.output_item.added",
-                    "output_index": idx,
-                    "item": item,
-                })
+                await _write_event(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": idx,
+                        "item": item,
+                    },
+                )
                 return call_id
 
             async def _emit_tool_completed(payload: Dict[str, Any]) -> None:
@@ -5054,16 +5347,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     "call_id": pending["call_id"],
                     "output": output_parts,
                 })
-                await _write_event("response.output_item.added", {
-                    "type": "response.output_item.added",
-                    "output_index": idx,
-                    "item": output_item,
-                })
-                await _write_event("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "output_index": idx,
-                    "item": output_item,
-                })
+                await _write_event(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": idx,
+                        "item": output_item,
+                    },
+                )
+                await _write_event(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": idx,
+                        "item": output_item,
+                    },
+                )
 
             async def _emit_compaction_status(payload: Dict[str, Any]) -> None:
                 """Emit an opt-in transient status understood by Open WebUI.
@@ -5112,9 +5411,16 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_compaction_status(payload)
                 elif isinstance(it, str):
                     # Batch text deltas — append to buffer, flush on timer
-                    _batch_buf.append(it)
-                    if _batch_timer is None:
-                        _batch_timer = asyncio.create_task(_batch_flush_after(0.05))
+                    content = media_buffer.feed(it) if media_buffer is not None else it
+                    if content:
+                        if "MEDIA:" in content:
+                            content = await self._export_outbound_media(
+                                content,
+                                exported_paths=media_exports,
+                            )
+                        _batch_buf.append(content)
+                        if _batch_timer is None:
+                            _batch_timer = asyncio.create_task(_batch_flush_after(0.05))
                 # Other types are silently dropped.
 
             # ── Batching state ──
@@ -5181,6 +5487,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 await _flush_batch()
 
             # Pick up agent result + usage from the completed task
+            agent_final = ""
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
@@ -5188,42 +5495,64 @@ class APIServerAdapter(BasePlatformAdapter):
                 # deltas were streamed (e.g. some providers only emit
                 # the full response at the end), emit a single fallback
                 # delta so Responses clients still receive a live text part.
-                agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
-                if agent_final and not final_text_parts:
+                agent_final = (
+                    result.get("final_response", "") if isinstance(result, dict) else ""
+                )
+                if agent_final and not final_text_parts and media_buffer is None:
                     await _emit_text_delta(agent_final)
                 if agent_final and not final_response_text:
                     final_response_text = agent_final
-                if isinstance(result, dict) and result.get("error") and not final_response_text:
+                if (
+                    isinstance(result, dict)
+                    and result.get("error")
+                    and not final_response_text
+                ):
                     agent_error = _redact_api_error_text(result["error"])
             except Exception as e:  # noqa: BLE001
-                logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
+                logger.error(
+                    "Error running agent for streaming responses: %s", e, exc_info=True
+                )
                 agent_error = _redact_api_error_text(e)
+
+            if media_buffer is not None:
+                media_tail = media_buffer.finish(agent_final)
+                if media_tail:
+                    await _emit_text_delta(
+                        await self._export_outbound_media(
+                            media_tail,
+                            exported_paths=media_exports,
+                        )
+                    )
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
             if message_opened:
-                await _write_event("response.output_text.done", {
-                    "type": "response.output_text.done",
-                    "item_id": message_item_id,
-                    "output_index": message_output_index,
-                    "content_index": 0,
-                    "text": final_response_text,
-                    "logprobs": [],
-                })
+                await _write_event(
+                    "response.output_text.done",
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": message_item_id,
+                        "output_index": message_output_index,
+                        "content_index": 0,
+                        "text": final_response_text,
+                        "logprobs": [],
+                    },
+                )
                 msg_done_item = {
                     "id": message_item_id,
                     "type": "message",
                     "status": "completed",
                     "role": "assistant",
-                    "content": [
-                        {"type": "output_text", "text": final_response_text}
-                    ],
+                    "content": [{"type": "output_text", "text": final_response_text}],
                 }
-                await _write_event("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "output_index": message_output_index,
-                    "item": msg_done_item,
-                })
+                await _write_event(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": message_output_index,
+                        "item": msg_done_item,
+                    },
+                )
 
             # Always append a final message item in the completed
             # response envelope so clients that only parse the terminal
@@ -5249,24 +5578,39 @@ class APIServerAdapter(BasePlatformAdapter):
                     _output = _item.get("output", [])
                     if isinstance(_output, list) and _output:
                         _first = _output[0]
-                        if isinstance(_first, dict) and _first.get("type") == "input_text":
+                        if (
+                            isinstance(_first, dict)
+                            and _first.get("type") == "input_text"
+                        ):
                             _text = _first.get("text", "")
                             if len(_text) > 1000:
-                                _first["text"] = _text[:500] + "...[" + str(len(_text) - 500) + " more chars]"
+                                _first["text"] = (
+                                    _text[:500]
+                                    + "...["
+                                    + str(len(_text) - 500)
+                                    + " more chars]"
+                                )
                                 _item["output"] = [_first]
 
             final_items.append({
                 "type": "message",
                 "role": "assistant",
                 "content": [
-                    {"type": "output_text", "text": final_response_text or (_redact_api_error_text(agent_error) if agent_error else "")}
+                    {
+                        "type": "output_text",
+                        "text": final_response_text
+                        or (_redact_api_error_text(agent_error) if agent_error else ""),
+                    }
                 ],
             })
 
             if agent_error:
                 failed_env = _envelope("failed")
                 failed_env["output"] = final_items
-                failed_env["error"] = {"message": _redact_api_error_text(agent_error), "type": "server_error"}
+                failed_env["error"] = {
+                    "message": _redact_api_error_text(agent_error),
+                    "type": "server_error",
+                }
                 failed_env["usage"] = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
@@ -5277,17 +5621,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 if final_response_text or agent_error:
                     _failed_history.append({
                         "role": "assistant",
-                        "content": final_response_text or _redact_api_error_text(agent_error),
+                        "content": final_response_text
+                        or _redact_api_error_text(agent_error),
                     })
                 _persist_response_snapshot(
                     failed_env,
                     conversation_history_snapshot=_failed_history,
                 )
                 terminal_snapshot_persisted = True
-                await _write_event("response.failed", {
-                    "type": "response.failed",
-                    "response": failed_env,
-                })
+                await _write_event(
+                    "response.failed",
+                    {
+                        "type": "response.failed",
+                        "response": failed_env,
+                    },
+                )
             else:
                 completed_env = _envelope("completed")
                 completed_env["output"] = final_items
@@ -5456,28 +5804,48 @@ class APIServerAdapter(BasePlatformAdapter):
         if raw_history:
             if not isinstance(raw_history, list):
                 return web.json_response(
-                    _openai_error("'conversation_history' must be an array of message objects"),
+                    _openai_error(
+                        "'conversation_history' must be an array of message objects"
+                    ),
                     status=400,
                 )
             for i, entry in enumerate(raw_history):
-                if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
+                if (
+                    not isinstance(entry, dict)
+                    or "role" not in entry
+                    or "content" not in entry
+                ):
                     return web.json_response(
-                        _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
+                        _openai_error(
+                            f"conversation_history[{i}] must have 'role' and 'content' fields"
+                        ),
                         status=400,
                     )
                 try:
                     entry_content = _normalize_multimodal_content(entry["content"])
                 except ValueError as exc:
-                    return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
-                conversation_history.append({"role": str(entry["role"]), "content": entry_content})
+                    return _multimodal_validation_error(
+                        exc, param=f"conversation_history[{i}].content"
+                    )
+                conversation_history.append({
+                    "role": str(entry["role"]),
+                    "content": entry_content,
+                })
             if previous_response_id:
-                logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
+                logger.debug(
+                    "Both conversation_history and previous_response_id provided; using conversation_history"
+                )
 
         stored_session_id = None
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored is None:
-                return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
+                return web.json_response(
+                    _openai_error(
+                        f"Previous response not found: {previous_response_id}"
+                    ),
+                    status=404,
+                )
             conversation_history = list(stored.get("conversation_history", []))
             stored_session_id = stored.get("session_id")
             # Preserve Responses API metadata continuity. _create_agent()
@@ -5553,20 +5921,28 @@ class APIServerAdapter(BasePlatformAdapter):
 
             def _on_tool_start(tool_call_id, function_name, function_args):
                 """Queue a started tool for live function_call streaming."""
-                _stream_q.put_threadsafe(("__tool_started__", {
-                    "tool_call_id": tool_call_id,
-                    "name": function_name,
-                    "arguments": function_args or {},
-                }))
+                _stream_q.put_threadsafe((
+                    "__tool_started__",
+                    {
+                        "tool_call_id": tool_call_id,
+                        "name": function_name,
+                        "arguments": function_args or {},
+                    },
+                ))
 
-            def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+            def _on_tool_complete(
+                tool_call_id, function_name, function_args, function_result
+            ):
                 """Queue a completed tool result for live function_call_output streaming."""
-                _stream_q.put_threadsafe(("__tool_completed__", {
-                    "tool_call_id": tool_call_id,
-                    "name": function_name,
-                    "arguments": function_args or {},
-                    "result": function_result,
-                }))
+                _stream_q.put_threadsafe((
+                    "__tool_completed__",
+                    {
+                        "tool_call_id": tool_call_id,
+                        "name": function_name,
+                        "arguments": function_args or {},
+                        "result": function_result,
+                    },
+                ))
 
             def _on_compaction(phase, payload):
                 """Bridge semantic compaction lifecycle into an opt-in SSE event."""
@@ -5580,11 +5956,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     if not compaction_status_active:
                         return
                     compaction_status_active = False
-                    _stream_q.put_threadsafe(("__compaction_status__", {
-                        "message": text,
-                        "done": True,
-                        "error": phase == "failed" or bool(data.get("error")),
-                    }))
+                    _stream_q.put_threadsafe((
+                        "__compaction_status__",
+                        {
+                            "message": text,
+                            "done": True,
+                            "error": phase == "failed" or bool(data.get("error")),
+                        },
+                    ))
                     return
 
                 if phase != "started":
@@ -5592,28 +5971,33 @@ class APIServerAdapter(BasePlatformAdapter):
                 if compaction_status_active:
                     return
                 compaction_status_active = True
-                _stream_q.put_threadsafe(("__compaction_status__", {
-                    "message": text,
-                    "done": False,
-                    "error": False,
-                }))
+                _stream_q.put_threadsafe((
+                    "__compaction_status__",
+                    {
+                        "message": text,
+                        "done": False,
+                        "error": False,
+                    },
+                ))
 
             agent_ref = [None]
-            agent_task = asyncio.ensure_future(self._run_agent(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                ephemeral_system_prompt=instructions,
-                session_id=session_id,
-                stream_delta_callback=_on_delta,
-                compaction_callback=_on_compaction,
-                tool_progress_callback=_on_tool_progress,
-                tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete,
-                agent_ref=agent_ref,
-                gateway_session_key=gateway_session_key,
-                **agent_overrides,
-                route=route,
-            ))
+            agent_task = asyncio.ensure_future(
+                self._run_agent(
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    ephemeral_system_prompt=instructions,
+                    session_id=session_id,
+                    stream_delta_callback=_on_delta,
+                    compaction_callback=_on_compaction,
+                    tool_progress_callback=_on_tool_progress,
+                    tool_start_callback=_on_tool_start,
+                    tool_complete_callback=_on_tool_complete,
+                    agent_ref=agent_ref,
+                    gateway_session_key=gateway_session_key,
+                    **agent_overrides,
+                    route=route,
+                )
+            )
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put_nowait(None))
@@ -5679,13 +6063,19 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        f"Internal server error: {e}", err_type="server_error"
+                    ),
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
+        final_response = await self._export_outbound_media(
+            result.get("final_response", "")
+        )
         if not final_response:
-            final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
+            final_response = _redact_api_error_text(
+                result.get("error", "(No response generated)")
+            )
 
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         created_at = int(time.time())
@@ -5717,7 +6107,11 @@ class APIServerAdapter(BasePlatformAdapter):
             user_message,
             result,
         )
-        output_items = self._extract_output_items(result, start_index=output_start_index)
+        output_items = self._extract_output_items(
+            result,
+            start_index=output_start_index,
+            final_response=final_response,
+        )
 
         response_data = {
             "id": response_id,
@@ -5777,7 +6171,9 @@ class APIServerAdapter(BasePlatformAdapter):
         response_id = request.match_info["response_id"]
         deleted = self._response_store.delete(response_id)
         if not deleted:
-            return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
+            return web.json_response(
+                _openai_error(f"Response not found: {response_id}"), status=404
+            )
 
         return web.json_response({
             "id": response_id,
@@ -6289,7 +6685,11 @@ class APIServerAdapter(BasePlatformAdapter):
         return out
 
     @staticmethod
-    def _extract_output_items(result: Dict[str, Any], start_index: int = 0) -> List[Dict[str, Any]]:
+    def _extract_output_items(
+        result: Dict[str, Any],
+        start_index: int = 0,
+        final_response: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Build the output item array from the agent's messages.
 
@@ -6331,9 +6731,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
         # Final assistant message
-        final = result.get("final_response", "")
+        final = (
+            final_response
+            if final_response is not None
+            else result.get("final_response", "")
+        )
         if not final:
-            final = _redact_api_error_text(result.get("error", "(No response generated)"))
+            final = _redact_api_error_text(
+                result.get("error", "(No response generated)")
+            )
 
         items.append({
             "type": "message",
@@ -6671,7 +7077,9 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
-    def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
+    def _set_run_status(
+        self, run_id: str, status: str, **fields: Any
+    ) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
         current = self._run_statuses.get(run_id, {})
@@ -6702,7 +7110,13 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
+        def _callback(
+            event_type: str,
+            tool_name: str = None,
+            preview: str = None,
+            args=None,
+            **kwargs,
+        ):
             ts = time.time()
             if event_type == "tool.started":
                 _push({
@@ -6816,18 +7230,31 @@ class APIServerAdapter(BasePlatformAdapter):
         if raw_history:
             if not isinstance(raw_history, list):
                 return web.json_response(
-                    _openai_error("'conversation_history' must be an array of message objects"),
+                    _openai_error(
+                        "'conversation_history' must be an array of message objects"
+                    ),
                     status=400,
                 )
             for i, entry in enumerate(raw_history):
-                if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
+                if (
+                    not isinstance(entry, dict)
+                    or "role" not in entry
+                    or "content" not in entry
+                ):
                     return web.json_response(
-                        _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
+                        _openai_error(
+                            f"conversation_history[{i}] must have 'role' and 'content' fields"
+                        ),
                         status=400,
                     )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+                conversation_history.append({
+                    "role": str(entry["role"]),
+                    "content": str(entry["content"]),
+                })
             if previous_response_id:
-                logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
+                logger.debug(
+                    "Both conversation_history and previous_response_id provided; using conversation_history"
+                )
 
         stored_session_id = None
         if not conversation_history and previous_response_id:
@@ -6843,17 +7270,25 @@ class APIServerAdapter(BasePlatformAdapter):
         # When input is a multi-message array, extract all but the last
         # message as conversation history (the last becomes user_message).
         # Only fires when no explicit history was provided.
-        if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
+        if (
+            not conversation_history
+            and isinstance(raw_input, list)
+            and len(raw_input) > 1
+        ):
             for msg in raw_input[:-1]:
                 if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
                     content = msg["content"]
                     if isinstance(content, list):
                         # Flatten multi-part content blocks to text
                         content = " ".join(
-                            part.get("text", "") for part in content
+                            part.get("text", "")
+                            for part in content
                             if isinstance(part, dict) and part.get("type") == "text"
                         )
-                    conversation_history.append({"role": msg["role"], "content": str(content)})
+                    conversation_history.append({
+                        "role": msg["role"],
+                        "content": str(content),
+                    })
 
         session_id = body.get("session_id") or stored_session_id
         route = self._resolve_route(body.get("model"))
@@ -6885,6 +7320,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_approval_sessions[run_id] = approval_session_key
 
         event_cb = self._make_run_event_callback(run_id, loop)
+        media_buffer = (
+            OutboundMediaStreamBuffer() if self._outbound_files is not None else None
+        )
+        media_exports: Dict[str, str] = {}
+        media_delta_queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
@@ -6898,14 +7338,40 @@ class APIServerAdapter(BasePlatformAdapter):
             if run_id not in self._run_streams:
                 return
             try:
-                loop.call_soon_threadsafe(_put_event_if_active, {
+                if media_buffer is not None:
+                    loop.call_soon_threadsafe(media_delta_queue.put_nowait, delta)
+                    return
+                loop.call_soon_threadsafe(
+                    _put_event_if_active,
+                    {
+                        "event": "message.delta",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "delta": delta,
+                    },
+                )
+            except Exception:
+                pass
+
+        async def _stream_media_deltas() -> None:
+            while True:
+                delta = await media_delta_queue.get()
+                if delta is None:
+                    return
+                content = media_buffer.feed(delta)
+                if not content:
+                    continue
+                if "MEDIA:" in content:
+                    content = await self._export_outbound_media(
+                        content,
+                        exported_paths=media_exports,
+                    )
+                _put_event_if_active({
                     "event": "message.delta",
                     "run_id": run_id,
                     "timestamp": time.time(),
-                    "delta": delta,
+                    "delta": content,
                 })
-            except Exception:
-                pass
 
         self._set_run_status(
             run_id,
@@ -6920,6 +7386,11 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         async def _run_and_close():
+            media_delta_task = (
+                asyncio.create_task(_stream_media_deltas())
+                if media_buffer is not None
+                else None
+            )
             try:
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
@@ -6957,7 +7428,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     if "command" in event:
                         from gateway.run import _redact_approval_command
 
-                        event["command"] = _redact_approval_command(event.get("command"))
+                        event["command"] = _redact_approval_command(
+                            event.get("command")
+                        )
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
@@ -7040,13 +7513,23 @@ class APIServerAdapter(BasePlatformAdapter):
                                     except Exception:
                                         pass
                         u = {
-                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                            "input_tokens": getattr(agent, "session_prompt_tokens", 0)
+                            or 0,
+                            "output_tokens": getattr(
+                                agent, "session_completion_tokens", 0
+                            )
+                            or 0,
+                            "total_tokens": getattr(agent, "session_total_tokens", 0)
+                            or 0,
                         }
                         return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                result, usage = await asyncio.get_running_loop().run_in_executor(
+                    None, _run_sync
+                )
+                if media_delta_task is not None:
+                    await media_delta_queue.put(None)
+                    await media_delta_task
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -7062,7 +7545,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
                 elif isinstance(result, dict) and result.get("failed"):
-                    error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
+                    error_msg = _redact_api_error_text(
+                        result.get("error") or "agent run failed"
+                    )
                     _put_event_if_active({
                         "event": "run.failed",
                         "run_id": run_id,
@@ -7076,11 +7561,44 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.failed",
                     )
                 else:
-                    final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                    raw_final_response = (
+                        result.get("final_response", "")
+                        if isinstance(result, dict)
+                        else ""
+                    )
+                    if media_buffer is not None:
+                        media_tail = media_buffer.finish(raw_final_response)
+                        rendered_tail = (
+                            await self._export_outbound_media(
+                                media_tail,
+                                exported_paths=media_exports,
+                            )
+                            if media_tail
+                            else ""
+                        )
+                        if rendered_tail:
+                            _put_event_if_active({
+                                "event": "message.delta",
+                                "run_id": run_id,
+                                "timestamp": time.time(),
+                                "delta": rendered_tail,
+                            })
+                        final_response = await self._export_outbound_media(
+                            raw_final_response,
+                            exported_paths=media_exports,
+                        )
+                    else:
+                        final_response = await self._export_outbound_media(
+                            raw_final_response
+                        )
                     # Undelivered steer text (accepted after the final response;
                     # see turn_finalizer) rides on the terminal event/status so
                     # the client can replay it as the next user turn.
-                    pending_steer = result.get("pending_steer") if isinstance(result, dict) else None
+                    pending_steer = (
+                        result.get("pending_steer")
+                        if isinstance(result, dict)
+                        else None
+                    )
                     completed_event = {
                         "event": "run.completed",
                         "run_id": run_id,
@@ -7157,6 +7675,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                if media_delta_task is not None and not media_delta_task.done():
+                    media_delta_task.cancel()
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -7410,7 +7930,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": time.time(),
                     "accepted": True,
                 })
-        return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
+        return web.json_response({
+            "object": "hermes.run.steer",
+            "run_id": run_id,
+            "accepted": True,
+        })
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""

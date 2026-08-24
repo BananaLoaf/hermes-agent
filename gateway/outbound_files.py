@@ -1,0 +1,612 @@
+"""Export local Hermes files through configurable external providers."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import mimetypes
+import re
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from string import Formatter
+from typing import Any, Callable, Mapping, Optional
+from urllib.parse import urljoin, urlsplit, urlunsplit
+
+try:
+    import aiohttp
+except ImportError:  # Keep gateway imports usable without the messaging extra.
+    aiohttp = None
+
+from gateway.platforms.base import (
+    MEDIA_TAG_CLEANUP_RE,
+    BasePlatformAdapter,
+    validate_media_delivery_path,
+)
+from hermes_time import now as hermes_now
+
+logger = logging.getLogger(__name__)
+
+
+class OutboundFilesConfigError(ValueError):
+    """Raised when an explicitly configured outbound-files backend is invalid."""
+
+
+class OutboundFileUploadError(RuntimeError):
+    """Raised when an outbound provider cannot publish a file."""
+
+
+_DURATION_RE = re.compile(r"^(?P<amount>\d+(?:\.\d+)?)(?P<unit>ms|s|m|h|d|w|y)$")
+_DURATION_SECONDS = {
+    "ms": 0.001,
+    "s": 1,
+    "m": 60,
+    "h": 60 * 60,
+    "d": 24 * 60 * 60,
+    "w": 7 * 24 * 60 * 60,
+    "y": 365 * 24 * 60 * 60,
+}
+_INLINE_IMAGE_MIME_TYPES = frozenset(
+    {
+        "image/avif",
+        "image/bmp",
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    }
+)
+_FALLBACK_MEDIA_RE = re.compile(
+    r"""MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|"""
+    r"""(?:~/|/|[A-Za-z]:[/\\])[^\n]*?)(?=\n|MEDIA:|$)""",
+    re.IGNORECASE,
+)
+_DEFAULT_IMAGE_TEMPLATE = "![{filename}]({url})"
+_DEFAULT_FILE_TEMPLATE = "[Download {filename}]({url})"
+_DEFAULT_INVALID_IMAGE_TEMPLATE = "[Image unavailable]"
+_DEFAULT_INVALID_FILE_TEMPLATE = "[File unavailable]"
+_OUTPUT_TEMPLATE_FIELDS = frozenset(
+    {
+        "url",
+        "filename",
+        "date",
+        "time",
+        "datetime",
+        "expiration_date",
+        "expiration_time",
+        "expiration_datetime",
+    }
+)
+
+
+def _required_string(data: Mapping[str, Any], key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise OutboundFilesConfigError(
+            f"outbound_files.{key} must be a non-empty string"
+        )
+    return value.strip()
+
+
+def _optional_duration(
+    data: Mapping[str, Any], key: str, default: Optional[str]
+) -> Optional[str]:
+    value = data.get(key, default)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise OutboundFilesConfigError(
+            f"outbound_files.{key} must be a duration such as 7d or 5h, or null"
+        )
+    duration = value.strip()
+    match = _DURATION_RE.fullmatch(duration)
+    if match is None:
+        raise OutboundFilesConfigError(
+            f"outbound_files.{key} must be a duration such as 7d or 5h, or null"
+        )
+    if float(match.group("amount")) <= 0:
+        raise OutboundFilesConfigError(
+            f"outbound_files.{key} duration must be greater than zero"
+        )
+    return duration
+
+
+def _configured_now() -> datetime:
+    return hermes_now()
+
+
+def _duration_delta(value: str) -> timedelta:
+    match = _DURATION_RE.fullmatch(value)
+    if match is None:  # Values are validated while loading the config.
+        raise OutboundFilesConfigError(f"invalid outbound file duration: {value}")
+    seconds = float(match.group("amount")) * _DURATION_SECONDS[match.group("unit")]
+    return timedelta(seconds=seconds)
+
+
+def _timestamp_parts(value: Optional[datetime], *, prefix: str = "") -> dict[str, str]:
+    if value is None:
+        return {
+            f"{prefix}date": "",
+            f"{prefix}time": "",
+            f"{prefix}datetime": "",
+        }
+    return {
+        f"{prefix}date": value.strftime("%Y-%m-%d"),
+        f"{prefix}time": value.strftime("%H:%M"),
+        f"{prefix}datetime": value.strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+def _template_timestamp_values(expiry: Optional[str]) -> dict[str, str]:
+    created_at = _configured_now()
+    expiration_at = None
+    if expiry:
+        expiration_at = (
+            created_at.astimezone(timezone.utc) + _duration_delta(expiry)
+        ).astimezone(created_at.tzinfo)
+    return {
+        **_timestamp_parts(created_at),
+        **_timestamp_parts(expiration_at, prefix="expiration_"),
+    }
+
+
+def _output_template(
+    value: Any,
+    *,
+    key: str,
+    default: str,
+    allowed_fields: frozenset[str] = _OUTPUT_TEMPLATE_FIELDS,
+    required_fields: frozenset[str] = frozenset({"url"}),
+) -> str:
+    if value is None:
+        value = default
+    if not isinstance(value, str) or not value.strip():
+        raise OutboundFilesConfigError(
+            f"outbound_files.templates.{key} must be a non-empty string"
+        )
+
+    template = value
+    fields: set[str] = set()
+    try:
+        for _literal, field_name, format_spec, conversion in Formatter().parse(
+            template
+        ):
+            if field_name is None:
+                continue
+            if field_name not in allowed_fields:
+                raise OutboundFilesConfigError(
+                    f"outbound_files.templates.{key} contains unsupported "
+                    f"placeholder: {field_name}"
+                )
+            if format_spec or conversion:
+                raise OutboundFilesConfigError(
+                    f"outbound_files.templates.{key} placeholders must not use "
+                    "format specifiers or conversions"
+                )
+            fields.add(field_name)
+    except ValueError as exc:
+        raise OutboundFilesConfigError(
+            f"outbound_files.templates.{key} is not a valid template"
+        ) from exc
+
+    missing = required_fields - fields
+    if missing:
+        placeholders = ", ".join(f"{{{field}}}" for field in sorted(missing))
+        raise OutboundFilesConfigError(
+            f"outbound_files.templates.{key} must contain {placeholders}"
+        )
+    return template
+
+
+def _output_templates(raw: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    templates = raw.get("templates")
+    if templates is None:
+        templates = {}
+    if not isinstance(templates, Mapping):
+        raise OutboundFilesConfigError("outbound_files.templates must be a mapping")
+
+    unknown = set(templates) - {
+        "image",
+        "file",
+        "invalid_image",
+        "invalid_file",
+    }
+    if unknown:
+        raise OutboundFilesConfigError(
+            "outbound_files.templates contains unsupported keys: "
+            + ", ".join(sorted(str(key) for key in unknown))
+        )
+    return (
+        _output_template(
+            templates.get("image"),
+            key="image",
+            default=_DEFAULT_IMAGE_TEMPLATE,
+        ),
+        _output_template(
+            templates.get("file"),
+            key="file",
+            default=_DEFAULT_FILE_TEMPLATE,
+        ),
+        _output_template(
+            templates.get("invalid_image"),
+            key="invalid_image",
+            default=_DEFAULT_INVALID_IMAGE_TEMPLATE,
+            allowed_fields=frozenset(),
+            required_fields=frozenset(),
+        ),
+        _output_template(
+            templates.get("invalid_file"),
+            key="invalid_file",
+            default=_DEFAULT_INVALID_FILE_TEMPLATE,
+            allowed_fields=frozenset(),
+            required_fields=frozenset(),
+        ),
+    )
+
+
+def _normalize_base_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise OutboundFilesConfigError(
+            "outbound_files.base_url must be an absolute HTTP(S) URL"
+        )
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise OutboundFilesConfigError(
+            "outbound_files.base_url must not contain credentials, a query, or a fragment"
+        )
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _normalize_public_url(value: Any, *, base_url: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise OutboundFileUploadError("outbound provider returned no file URL")
+    url = urljoin(f"{base_url}/", value.strip())
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise OutboundFileUploadError("outbound provider returned an invalid file URL")
+    if parsed.username or parsed.password:
+        raise OutboundFileUploadError("outbound provider returned an unsafe file URL")
+    return url
+
+
+@dataclass(frozen=True)
+class OutboundFilesConfig:
+    """Provider-independent outbound file settings."""
+
+    provider: str
+    file_expiry: Optional[str] = "7d"
+    image_expiry: Optional[str] = None
+    image_template: str = _DEFAULT_IMAGE_TEMPLATE
+    file_template: str = _DEFAULT_FILE_TEMPLATE
+    invalid_image_template: str = _DEFAULT_INVALID_IMAGE_TEMPLATE
+    invalid_file_template: str = _DEFAULT_INVALID_FILE_TEMPLATE
+    provider_options: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> Optional["OutboundFilesConfig"]:
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping):
+            raise OutboundFilesConfigError("outbound_files must be a mapping")
+
+        provider = _required_string(raw, "provider").lower()
+        (
+            image_template,
+            file_template,
+            invalid_image_template,
+            invalid_file_template,
+        ) = _output_templates(raw)
+        common_keys = {"provider", "file_expiry", "image_expiry", "templates"}
+        return cls(
+            provider=provider,
+            file_expiry=_optional_duration(raw, "file_expiry", "7d"),
+            image_expiry=_optional_duration(raw, "image_expiry", None),
+            image_template=image_template,
+            file_template=file_template,
+            invalid_image_template=invalid_image_template,
+            invalid_file_template=invalid_file_template,
+            provider_options={
+                key: value for key, value in raw.items() if key not in common_keys
+            },
+        )
+
+    def expiry_for(self, *, image: bool) -> Optional[str]:
+        return self.image_expiry if image else self.file_expiry
+
+
+@dataclass(frozen=True)
+class UploadedFile:
+    """Provider-neutral result of publishing one local file."""
+
+    url: str
+    provider_file_id: Optional[str] = None
+
+
+class OutboundFileProvider(ABC):
+    """Publish a local file and return its externally reachable URL."""
+
+    @abstractmethod
+    async def upload(self, path: Path, *, expiry: Optional[str]) -> UploadedFile:
+        """Upload ``path`` with an optional relative expiry duration."""
+
+
+class ZiplineOutboundFileProvider(OutboundFileProvider):
+    """Upload files through Zipline's multipart API."""
+
+    def __init__(self, options: Mapping[str, Any]):
+        if aiohttp is None:
+            raise OutboundFilesConfigError(
+                "outbound_files.provider=zipline requires aiohttp"
+            )
+        self._base_url = _normalize_base_url(_required_string(options, "base_url"))
+        self._api_key = _required_string(options, "api_key")
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    async def upload(self, path: Path, *, expiry: Optional[str]) -> UploadedFile:
+        if not path.is_file():
+            raise OutboundFileUploadError("outbound upload source is not a file")
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        headers = {
+            "Authorization": self._api_key,
+            "x-zipline-format": "random",
+            "x-zipline-original-name": "true",
+        }
+        if expiry is not None:
+            headers["x-zipline-deletes-at"] = expiry
+
+        timeout = aiohttp.ClientTimeout(total=120)
+        try:
+            with path.open("rb") as file_handle:
+                form = aiohttp.FormData()
+                form.add_field(
+                    "file",
+                    file_handle,
+                    filename=path.name,
+                    content_type=content_type,
+                )
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        f"{self._base_url}/api/upload",
+                        headers=headers,
+                        data=form,
+                    ) as response:
+                        if response.status < 200 or response.status >= 300:
+                            raise OutboundFileUploadError(
+                                f"Zipline upload failed with HTTP {response.status}"
+                            )
+                        try:
+                            payload = await response.json(content_type=None)
+                        except Exception as exc:
+                            raise OutboundFileUploadError(
+                                "Zipline returned an invalid upload response"
+                            ) from exc
+        except OutboundFileUploadError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            raise OutboundFileUploadError("Zipline upload failed") from exc
+
+        files = payload.get("files") if isinstance(payload, Mapping) else None
+        if (
+            not isinstance(files, list)
+            or len(files) != 1
+            or not isinstance(files[0], Mapping)
+        ):
+            raise OutboundFileUploadError("Zipline returned an invalid upload response")
+        item = files[0]
+        file_id = item.get("id")
+        return UploadedFile(
+            url=_normalize_public_url(item.get("url"), base_url=self._base_url),
+            provider_file_id=file_id if isinstance(file_id, str) and file_id else None,
+        )
+
+
+_PROVIDER_FACTORIES: dict[str, Callable[[Mapping[str, Any]], OutboundFileProvider]] = {
+    "zipline": ZiplineOutboundFileProvider,
+}
+
+
+def create_outbound_file_provider(config: OutboundFilesConfig) -> OutboundFileProvider:
+    factory = _PROVIDER_FACTORIES.get(config.provider)
+    if factory is None:
+        raise OutboundFilesConfigError(
+            f"unsupported outbound_files.provider: {config.provider}"
+        )
+    return factory(config.provider_options)
+
+
+def _is_inline_image(path: Path) -> bool:
+    return mimetypes.guess_type(path.name)[0] in _INLINE_IMAGE_MIME_TYPES
+
+
+def _markdown_label(value: str) -> str:
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", "", value).strip() or "file"
+    return cleaned.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def _normalize_media_path(value: str) -> str:
+    path = str(value or "").strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in {'"', "'", "`"}:
+        path = path[1:-1].strip()
+    return path
+
+
+class OutboundFileExporter:
+    """Validate MEDIA paths, publish them, and render provider-neutral Markdown."""
+
+    def __init__(self, config: OutboundFilesConfig, provider: OutboundFileProvider):
+        self.config = config
+        self.provider = provider
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> Optional["OutboundFileExporter"]:
+        config = OutboundFilesConfig.from_dict(raw)
+        if config is None:
+            return None
+        return cls(config, create_outbound_file_provider(config))
+
+    async def export_file(self, path: Path) -> str:
+        image = _is_inline_image(path)
+        expiry = self.config.expiry_for(image=image)
+        uploaded = await self.provider.upload(
+            path,
+            expiry=expiry,
+        )
+        label = _markdown_label(path.name)
+        template = self.config.image_template if image else self.config.file_template
+        return template.format(
+            url=uploaded.url,
+            filename=label,
+            **_template_timestamp_values(expiry),
+        )
+
+    def invalid_output(self, path: Path) -> str:
+        template = (
+            self.config.invalid_image_template
+            if _is_inline_image(path)
+            else self.config.invalid_file_template
+        )
+        return template.format()
+
+    async def export_media_text(
+        self,
+        text: str,
+        *,
+        exported_paths: Optional[dict[str, str]] = None,
+    ) -> str:
+        if not text or "MEDIA:" not in text:
+            return text
+
+        scan_text = BasePlatformAdapter._mask_protected_spans(text)
+        scan_text = BasePlatformAdapter._mask_json_string_media(scan_text)
+        matches = [
+            (match.start(), match.end(), match.group("path"))
+            for match in MEDIA_TAG_CLEANUP_RE.finditer(scan_text)
+        ]
+        occupied = [(start, end) for start, end, _path in matches]
+        for match in _FALLBACK_MEDIA_RE.finditer(scan_text):
+            if any(
+                match.start() < end and match.end() > start for start, end in occupied
+            ):
+                continue
+            matches.append((match.start(), match.end(), match.group("path")))
+        if not matches:
+            return text
+        matches.sort(key=lambda item: item[0])
+
+        rendered: list[str] = []
+        cursor = 0
+        path_cache = exported_paths if exported_paths is not None else {}
+        for start, end, raw_path in matches:
+            rendered.append(text[cursor:start])
+            normalized_path = _normalize_media_path(raw_path)
+            safe_path = validate_media_delivery_path(normalized_path)
+            if not safe_path:
+                rendered.append(self.invalid_output(Path(normalized_path)))
+            else:
+                replacement = path_cache.get(safe_path)
+                if replacement is None:
+                    try:
+                        replacement = await self.export_file(Path(safe_path))
+                    except Exception as exc:
+                        logger.warning(
+                            "Outbound file upload through %s failed: %s",
+                            self.config.provider,
+                            type(exc).__name__,
+                        )
+                        replacement = self.invalid_output(Path(safe_path))
+                    path_cache[safe_path] = replacement
+                rendered.append(replacement)
+            cursor = end
+        rendered.append(text[cursor:])
+        return "".join(rendered)
+
+
+class OutboundMediaStreamBuffer:
+    """Release text once any MEDIA path in it has an explicit boundary."""
+
+    _MARKER = "MEDIA:"
+
+    def __init__(self):
+        self._pending = ""
+        self._emitted = ""
+        self._capturing_media = False
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+        self._pending += chunk
+        ready: list[str] = []
+
+        while self._pending:
+            if self._capturing_media:
+                media_end = self._complete_media_end()
+                if media_end is None:
+                    break
+                ready.append(self._pending[:media_end])
+                self._pending = self._pending[media_end:]
+                self._capturing_media = False
+                continue
+
+            marker_index = self._pending.find(self._MARKER)
+            if marker_index >= 0:
+                ready.append(self._pending[:marker_index])
+                self._pending = self._pending[marker_index:]
+                self._capturing_media = True
+                continue
+
+            keep = 0
+            max_keep = min(len(self._pending), len(self._MARKER) - 1)
+            for size in range(max_keep, 0, -1):
+                if self._MARKER.startswith(self._pending[-size:]):
+                    keep = size
+                    break
+            ready.append(self._pending[:-keep] if keep else self._pending)
+            self._pending = self._pending[-keep:] if keep else ""
+            break
+
+        output = "".join(ready)
+        self._emitted += output
+        return output
+
+    def _complete_media_end(self) -> Optional[int]:
+        """Return the raw directive end only when its boundary is explicit."""
+        prefix = re.match(r"MEDIA:\s*", self._pending)
+        if prefix is None:
+            return None
+        path_start = prefix.end()
+        if path_start >= len(self._pending):
+            return None
+
+        quote = self._pending[path_start]
+        if quote in {'"', "'", "`"}:
+            closing_quote = self._pending.find(quote, path_start + 1)
+            return closing_quote + 1 if closing_quote >= 0 else None
+
+        # A NUL sentinel prevents the regex's end-of-string branch from
+        # treating the latest partial chunk as a complete path. Real
+        # whitespace, punctuation, or a following MEDIA: still terminates it.
+        known_extension = MEDIA_TAG_CLEANUP_RE.match(f"{self._pending}\0")
+        if known_extension is not None:
+            return known_extension.end()
+
+        newline = self._pending.find("\n", path_start)
+        if newline >= 0:
+            return newline
+
+        next_marker = self._pending.find(self._MARKER, path_start)
+        if next_marker >= 0:
+            return next_marker
+        return None
+
+    def finish(self, authoritative_text: Optional[str] = None) -> str:
+        if authoritative_text and authoritative_text.startswith(self._emitted):
+            tail = authoritative_text[len(self._emitted) :]
+        else:
+            tail = self._pending
+        self._pending = ""
+        return tail

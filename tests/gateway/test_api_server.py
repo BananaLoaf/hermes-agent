@@ -169,6 +169,13 @@ class TestAdapterInit:
                 "port": 9999,
                 "key": "sk-test",
                 "cors_origins": ["http://localhost:3000"],
+                "outbound_files": {
+                    "provider": "zipline",
+                    "base_url": "https://files.example.com/",
+                    "api_key": "zipline-key",
+                    "file_expiry": "14d",
+                    "image_expiry": None,
+                },
             },
         )
         adapter = APIServerAdapter(config)
@@ -176,6 +183,8 @@ class TestAdapterInit:
         assert adapter._port == 9999
         assert adapter._api_key == "sk-test"
         assert adapter._cors_origins == ("http://localhost:3000",)
+        assert adapter._outbound_files.provider.base_url == "https://files.example.com"
+        assert adapter._outbound_files.config.file_expiry == "14d"
 
 
     def test_create_agent_forwards_runtime_config(self, monkeypatch):
@@ -2739,9 +2748,9 @@ class TestModelRoutesAgentCreation:
                 "api_mode": "chat_completions",
             },
         )
-        adapter = _make_routing_adapter(
-            {"alias": {"model": "other/model", "provider": "otherprov"}}
-        )
+        adapter = _make_routing_adapter({
+            "alias": {"model": "other/model", "provider": "otherprov"}
+        })
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
         monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
 
@@ -2761,7 +2770,9 @@ class TestModelRoutesAgentCreation:
                 captured.update(kwargs)
 
         _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
-        adapter = _make_routing_adapter({"alias": {"model": "route/model", "api_key": "sk-route"}})
+        adapter = _make_routing_adapter({
+            "alias": {"model": "route/model", "api_key": "sk-route"}
+        })
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
         monkeypatch.setattr(
             adapter,
