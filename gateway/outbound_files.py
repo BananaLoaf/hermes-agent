@@ -47,16 +47,17 @@ _DURATION_SECONDS = {
     "w": 7 * 24 * 60 * 60,
     "y": 365 * 24 * 60 * 60,
 }
-_INLINE_IMAGE_MIME_TYPES = frozenset(
-    {
-        "image/avif",
-        "image/bmp",
-        "image/gif",
-        "image/jpeg",
-        "image/png",
-        "image/webp",
-    }
-)
+_INLINE_IMAGE_MIME_BY_EXTENSION = {
+    ".png": "image/png",
+    ".apng": "image/apng",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".avif": "image/avif",
+    ".svg": "image/svg+xml",
+    ".bmp": "image/bmp",
+}
 _FALLBACK_MEDIA_RE = re.compile(
     r"""MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|"""
     r"""(?:~/|/|[A-Za-z]:[/\\])[^\n]*?)(?=\n|MEDIA:|$)""",
@@ -350,7 +351,7 @@ class ZiplineOutboundFileProvider(OutboundFileProvider):
     async def upload(self, path: Path, *, expiry: Optional[str]) -> UploadedFile:
         if not path.is_file():
             raise OutboundFileUploadError("outbound upload source is not a file")
-        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        content_type = _content_type_for_path(path)
         headers = {
             "Authorization": self._api_key,
             "x-zipline-format": "random",
@@ -420,7 +421,15 @@ def create_outbound_file_provider(config: OutboundFilesConfig) -> OutboundFilePr
 
 
 def _is_inline_image(path: Path) -> bool:
-    return mimetypes.guess_type(path.name)[0] in _INLINE_IMAGE_MIME_TYPES
+    return path.suffix.lower() in _INLINE_IMAGE_MIME_BY_EXTENSION
+
+
+def _content_type_for_path(path: Path) -> str:
+    return (
+        _INLINE_IMAGE_MIME_BY_EXTENSION.get(path.suffix.lower())
+        or mimetypes.guess_type(path.name)[0]
+        or "application/octet-stream"
+    )
 
 
 def _markdown_label(value: str) -> str:

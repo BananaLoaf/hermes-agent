@@ -1034,14 +1034,27 @@ else:
     cors_middleware = None  # type: ignore[assignment]
 
 
-_MEDIA_IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+_MEDIA_IMG_EXT = {
+    ".png",
+    ".apng",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".avif",
+    ".svg",
+    ".bmp",
+}
 _MEDIA_MIME = {
     ".png": "image/png",
+    ".apng": "image/apng",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".gif": "image/gif",
     ".webp": "image/webp",
+    ".avif": "image/avif",
     ".bmp": "image/bmp",
+    ".svg": "image/svg+xml",
 }
 _MEDIA_DATA_URL_MAX_BYTES = 5 * 1024 * 1024  # skip images larger than 5MB
 

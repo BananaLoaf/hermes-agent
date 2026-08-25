@@ -1881,7 +1881,10 @@ SUPPORTED_IMAGE_DOCUMENT_TYPES = {
 
 MEDIA_DELIVERY_EXTS: Tuple[str, ...] = (
     # Images (embed inline)
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg",
+    ".png", ".apng", ".jpg", ".jpeg", ".gif",
+    ".webp", ".avif", ".svg", ".bmp",
+    # Browser-specific images (deliver as files)
+    ".tif", ".tiff",
     # Video (embed inline where supported)
     ".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp",
     # Audio (delivered as voice/audio where supported)

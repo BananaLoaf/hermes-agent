@@ -50,6 +50,35 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
         text = "MEDIA:/tmp/archive.zip"
         self.assertEqual(_resolve_media_to_data_urls(text), text)
 
+    def test_svg_inlined_as_image(self):
+        import tempfile
+        from pathlib import Path
+
+        directory = Path(tempfile.mkdtemp(prefix="hermes_svg_media_test"))
+        path = directory / "diagram.svg"
+        path.write_text("<svg xmlns='http://www.w3.org/2000/svg'/>")
+
+        out = _resolve_media_to_data_urls(f"MEDIA:{path}")
+
+        self.assertIn("data:image/svg+xml;base64,", out)
+        self.assertNotIn("MEDIA:", out)
+
+    def test_apng_and_avif_are_inlined_as_images(self):
+        import tempfile
+        from pathlib import Path
+
+        directory = Path(tempfile.mkdtemp(prefix="hermes_modern_media_test"))
+        image_types = ((".apng", "image/apng"), (".avif", "image/avif"))
+        for suffix, mime_type in image_types:
+            with self.subTest(suffix=suffix):
+                path = directory / f"image{suffix}"
+                path.write_bytes(b"image")
+
+                out = _resolve_media_to_data_urls(f"MEDIA:{path}")
+
+                self.assertIn(f"data:{mime_type};base64,", out)
+                self.assertNotIn("MEDIA:", out)
+
 
 if __name__ == "__main__":
     unittest.main()

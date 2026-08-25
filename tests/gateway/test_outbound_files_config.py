@@ -13,6 +13,8 @@ from gateway.outbound_files import (
     OutboundMediaStreamBuffer,
     UploadedFile,
     ZiplineOutboundFileProvider,
+    _content_type_for_path,
+    _is_inline_image,
     create_outbound_file_provider,
 )
 
@@ -31,6 +33,32 @@ def _root(**overrides):
 
 def test_missing_section_disables_outbound_files():
     assert OutboundFilesConfig.from_dict(None) is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type"),
+    [
+        ("image.png", "image/png"),
+        ("image.apng", "image/apng"),
+        ("image.jpg", "image/jpeg"),
+        ("image.jpeg", "image/jpeg"),
+        ("image.gif", "image/gif"),
+        ("image.webp", "image/webp"),
+        ("image.avif", "image/avif"),
+        ("image.svg", "image/svg+xml"),
+        ("image.bmp", "image/bmp"),
+    ],
+)
+def test_reliable_web_images_use_inline_templates(filename, content_type):
+    path = Path(filename)
+
+    assert _is_inline_image(path) is True
+    assert _content_type_for_path(path) == content_type
+
+
+@pytest.mark.parametrize("filename", ["image.tif", "image.tiff", "image.heic"])
+def test_browser_specific_images_remain_downloadable_files(filename):
+    assert _is_inline_image(Path(filename)) is False
 
 
 def test_parses_provider_independent_config_and_durations():
@@ -211,8 +239,10 @@ class RecordingProvider(OutboundFileProvider):
 async def test_exporter_selects_expiry_and_markdown_by_file_kind(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
     image = tmp_path / "chart.png"
+    svg = tmp_path / "diagram.svg"
     document = tmp_path / "quarterly report.pdf"
     image.write_bytes(b"png")
+    svg.write_text("<svg xmlns='http://www.w3.org/2000/svg'/>")
     document.write_bytes(b"pdf")
     provider = RecordingProvider()
     config = OutboundFilesConfig.from_dict(
@@ -226,16 +256,17 @@ async def test_exporter_selects_expiry_and_markdown_by_file_kind(tmp_path, monke
     exporter = OutboundFileExporter(config, provider)
 
     rendered = await exporter.export_media_text(
-        f"Chart:\nMEDIA:{image}\nReport:\nMEDIA:{document}"
+        f"Chart:\nMEDIA:{image}\nDiagram:\nMEDIA:{svg}\nReport:\nMEDIA:{document}"
     )
 
     assert f"![chart.png](https://files.example.com/u/chart.png)" in rendered
+    assert f"![diagram.svg](https://files.example.com/u/diagram.svg)" in rendered
     assert (
         "[Download quarterly report.pdf]"
         "(https://files.example.com/u/quarterly%20report.pdf)"
     ) in rendered
     assert "MEDIA:" not in rendered
-    assert provider.uploads == [(image, None), (document, "7d")]
+    assert provider.uploads == [(image, None), (svg, None), (document, "7d")]
 
 
 @pytest.mark.asyncio
