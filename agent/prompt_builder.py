@@ -1114,10 +1114,10 @@ PLATFORM_HINTS = {
         "— when a sticker is the right response, use yb_send_sticker."
     ),
     "api_server": (
-        "You're responding through an API server. The rendering layer is unknown — "
-        "assume plain text. No markdown formatting (no asterisks, bullets, headers, "
-        "code fences). Treat this like a conversation, not a document. Keep responses "
-        "brief and natural. "
+        "You're responding through an API server whose client supports GitHub-flavored "
+        "Markdown. Use headings, lists, emphasis, links, tables, blockquotes, and fenced "
+        "code blocks whenever they improve the response. LaTeX math is also supported: "
+        "use $...$ for inline math and $$...$$ for display math. "
         "File/media delivery: images referenced as MEDIA:/absolute/path tags "
         "(.png/.jpg/.jpeg/.gif/.webp/.bmp, up to 5MB) are inlined as base64 data "
         "URLs in responses on the chat, completions, and responses endpoints. "
@@ -1139,6 +1139,21 @@ PLATFORM_HINTS = {
         "Use MEDIA:/absolute/path instead."
     ),
 }
+
+
+API_SERVER_OUTBOUND_FILES_HINT = (
+    "You're responding through an API server whose client supports GitHub-flavored "
+    "Markdown. Use headings, lists, emphasis, links, tables, blockquotes, and fenced "
+    "code blocks whenever they improve the response. LaTeX math is also supported: "
+    "use $...$ for inline math and $$...$$ for display math. "
+    "File/media delivery is enabled. To attach a generated local file, include "
+    "MEDIA:/absolute/path/to/file in your final response. The API gateway validates "
+    "the path, uploads the file through its configured outbound file provider, and "
+    "replaces the MEDIA: directive with a client-safe image or download link. Put each "
+    "MEDIA: directive on its own line; quote a path that contains spaces. Use MEDIA: "
+    "only for a file that actually exists. Do not expose raw local paths, and do not "
+    "claim that file attachments are unsupported."
+)
 
 # Telegram rich-messages extension — only injected when the user has opted in
 # to ``gateway.platforms.telegram.extra.rich_messages: true`` (or the

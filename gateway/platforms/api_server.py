@@ -3082,6 +3082,10 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        # Prompt assembly is lazy, so expose the adapter capability before the
+        # first model call. This keeps MEDIA: guidance truthful for API server
+        # instances that have no outbound file provider configured.
+        agent._outbound_file_delivery_enabled = self._outbound_files is not None
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,

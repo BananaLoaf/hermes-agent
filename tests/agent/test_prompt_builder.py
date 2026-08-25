@@ -723,6 +723,9 @@ class TestPromptBuilderConstants:
         assert "runs" in hint.lower()
         # Fallback guidance: plain file path in the response text.
         assert "plain" in hint.lower()
+        assert "markdown" in hint.lower()
+        assert "latex" in hint.lower()
+        assert "no markdown" not in hint.lower()
 
     def test_markdown_converting_platform_hints_do_not_forbid_markdown(self):
         """#12224 — WhatsApp (Baileys) and Signal adapters actively convert
@@ -1056,5 +1059,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-
