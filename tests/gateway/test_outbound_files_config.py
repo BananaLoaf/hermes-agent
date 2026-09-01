@@ -250,7 +250,6 @@ async def test_exporter_selects_expiry_and_markdown_by_file_kind(tmp_path, monke
             "provider": "test",
             "file_expiry": "7d",
             "image_expiry": None,
-            "templates": {"invalid": "FILE UNAVAILABLE"},
         }
     )
     exporter = OutboundFileExporter(config, provider)
