@@ -4,6 +4,9 @@ OpenAI-compatible API server platform adapter.
 Exposes an HTTP server with endpoints:
 - POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id or X-Hermes-Session-Id; X-Hermes-Session-Key and opt-in X-Hermes-Events supported)
+- POST /v1/files                   — upload a profile-local file for input_file.file_id
+- GET/DELETE /v1/files/{file_id}   — inspect or delete a profile-local file
+- GET /v1/files/{file_id}/content  — download original uploaded bytes
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
@@ -41,6 +44,8 @@ Requires:
 """
 
 import asyncio
+import base64
+import binascii
 import errno
 import hashlib
 import hmac
@@ -59,6 +64,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -85,11 +91,22 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.api_files import (
+    APIFileCorruptError,
+    APIFileNotFoundError,
+    APIFileStore,
+    sanitize_api_content_type,
+    sanitize_api_filename,
+)
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
+    _TEXT_INJECT_EXTENSIONS,
     BasePlatformAdapter,
     SendResult,
+    build_document_context_note,
+    cache_media_bytes,
     is_network_accessible,
+    reference_media_file,
     validate_media_delivery_path,
 )
 from agent.redact import redact_sensitive_text
@@ -152,7 +169,13 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+MAX_API_FILE_BYTES = 20 * 1024 * 1024
+MAX_API_FILES_PER_REQUEST = 10
+MAX_TEXT_ATTACHMENT_BYTES = 100 * 1024
+MAX_TOTAL_INLINE_TEXT_BYTES = MAX_API_FILES_PER_REQUEST * MAX_TEXT_ATTACHMENT_BYTES
+# A raw Files API upload is limited to 20 MiB. This also leaves enough room
+# for one backwards-compatible 20 MiB base64 ``file_data`` input plus JSON.
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -564,18 +587,197 @@ _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
 
 
+def _decode_inline_file_part(part: Dict[str, Any]) -> tuple[bytes, str, str]:
+    """Validate and decode one OpenAI ``input_file.file_data`` part."""
+    nested = part.get("file")
+    source = nested if isinstance(nested, dict) else part
+    file_data = source.get("file_data")
+    if not isinstance(file_data, str) or not file_data.strip():
+        raise ValueError("invalid_content_part:input_file must include non-empty file_data.")
+
+    filename = source.get("filename")
+    if filename is None:
+        filename = "attachment.bin"
+    if not isinstance(filename, str):
+        raise ValueError("invalid_content_part:input_file filename must be a string.")
+    filename = sanitize_api_filename(filename)
+
+    encoded = file_data.strip()
+    mime_type = "application/octet-stream"
+    if encoded.lower().startswith("data:"):
+        header, separator, encoded = encoded.partition(",")
+        if not separator or ";base64" not in header.lower():
+            raise ValueError("invalid_file_data:input_file data URLs must contain base64 data.")
+        declared_type = header[5:].split(";", 1)[0].strip().lower()
+        if declared_type:
+            mime_type = sanitize_api_content_type(declared_type)
+
+    # Reject oversized payloads before allocating decoded bytes. Four base64
+    # characters represent at most three bytes; whitespace is not accepted.
+    if len(encoded) > ((MAX_API_FILE_BYTES + 2) // 3) * 4:
+        raise ValueError(
+            f"file_too_large:input_file exceeds the {MAX_API_FILE_BYTES // (1024 * 1024)} MiB limit."
+        )
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("invalid_file_data:input_file file_data is not valid base64.")
+    if not raw:
+        raise ValueError("invalid_file_data:input_file must not be empty.")
+    if len(raw) > MAX_API_FILE_BYTES:
+        raise ValueError(
+            f"file_too_large:input_file exceeds the {MAX_API_FILE_BYTES // (1024 * 1024)} MiB limit."
+        )
+
+    return raw, filename, mime_type
+
+
+def _resolve_file_part(part: Dict[str, Any]) -> tuple[bytes, str, str, Optional[Path]]:
+    """Resolve an OpenAI file part from ``file_id`` or inline ``file_data``."""
+    nested = part.get("file")
+    source = nested if isinstance(nested, dict) else part
+    file_id = source.get("file_id")
+    file_data = source.get("file_data")
+
+    if file_id is not None and file_data is not None:
+        raise ValueError(
+            "invalid_content_part:input_file must include exactly one of file_id or file_data."
+        )
+    if file_id is None:
+        raw, filename, mime_type = _decode_inline_file_part(part)
+        return raw, filename, mime_type, None
+    if not isinstance(file_id, str) or not file_id.strip():
+        raise ValueError("invalid_content_part:input_file file_id must be a non-empty string.")
+
+    try:
+        record, raw = APIFileStore().read(file_id.strip(), max_bytes=MAX_API_FILE_BYTES)
+    except APIFileNotFoundError:
+        raise ValueError(f"file_not_found:No file found with id {file_id!r}.")
+    except APIFileCorruptError:
+        raise ValueError(f"file_corrupt:Stored file {file_id!r} is unavailable.")
+    except ValueError as exc:
+        raise ValueError(f"file_too_large:{exc}")
+    return raw, record.filename, record.content_type, record.content_path
+
+
+def _inline_text_attachment_content(
+    data: bytes,
+    *,
+    filename: str,
+    mime_type: str = "",
+) -> Optional[str]:
+    """Return an inline text block using Telegram's attachment behavior."""
+    # Copied from TelegramAdapter's document handling. Keep this local copy in
+    # sync with plugins/platforms/telegram/adapter.py; the API must mirror that
+    # behavior without making the Telegram adapter depend on API-server code.
+    ext = os.path.splitext(filename or "")[1].lower()
+    is_text = ext in _TEXT_INJECT_EXTENSIONS or (mime_type or "").startswith("text/")
+    if not is_text or len(data) > MAX_TEXT_ATTACHMENT_BYTES:
+        return None
+    try:
+        text_content = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    display_name = re.sub(r"[^\w.\- ]", "_", filename or f"document{ext or '.txt'}")
+    return f"[Content of {display_name}]:\n{text_content}"
+
+
+def _materialize_file_part(
+    raw: bytes,
+    filename: str,
+    mime_type: str,
+    stored_path: Optional[Path],
+) -> tuple[Dict[str, Any], int]:
+    """Expose a validated file and return its normalized part and inline text size."""
+
+    if stored_path is None:
+        cached = cache_media_bytes(raw, filename=filename, mime_type=mime_type)
+    else:
+        cached = reference_media_file(
+            stored_path,
+            raw,
+            filename=filename,
+            mime_type=mime_type,
+        )
+    if cached is None:
+        raise ValueError("invalid_file_data:input_file could not be decoded as the declared image type.")
+
+    if cached.kind == "image":
+        data_url = f"data:{cached.media_type};base64,{base64.b64encode(raw).decode('ascii')}"
+        return {"type": "image_url", "image_url": {"url": data_url}}, 0
+
+    inline_text_bytes = 0
+    if cached.kind == "audio":
+        note = (
+            f"[The user sent an audio attachment: '{cached.display_name}'. "
+            f"It is saved at: {cached.path}. Inspect or transcribe it before answering "
+            f"when the user's request depends on its contents.]"
+        )
+    elif cached.kind == "video":
+        note = (
+            f"[The user sent a video attachment: '{cached.display_name}'. "
+            f"It is saved at: {cached.path}. Inspect or process it before answering "
+            f"when the user's request depends on its contents.]"
+        )
+    else:
+        inline_content = _inline_text_attachment_content(
+            raw,
+            filename=cached.display_name,
+            mime_type=cached.media_type,
+        )
+        note = build_document_context_note(
+            cached.display_name,
+            cached.path,
+            cached.media_type,
+            content_inlined=inline_content is not None,
+        )
+        if inline_content:
+            note = f"{note}\n\n{inline_content}"
+            inline_text_bytes = len(raw)
+
+    return {"type": "text", "text": note}, inline_text_bytes
+
+
+def _count_file_parts(content: Any) -> int:
+    """Count materializable file parts in one bounded content array."""
+    if not isinstance(content, list):
+        return 0
+    items = content[:MAX_CONTENT_LIST_SIZE]
+    return sum(
+        1
+        for part in items
+        if isinstance(part, dict)
+        and str(part.get("type") or "").strip().lower() in _FILE_PART_TYPES
+    )
+
+
+def _validate_multimodal_file_limit(contents: list[Any]) -> None:
+    """Apply the attachment count limit once across an entire HTTP request."""
+    if sum(_count_file_parts(content) for content in contents) > MAX_API_FILES_PER_REQUEST:
+        raise ValueError(
+            f"too_many_files:At most {MAX_API_FILES_PER_REQUEST} files "
+            "may be sent in one request."
+        )
+
+
 def _normalize_multimodal_content(content: Any) -> Any:
     """Validate and normalize multimodal content for the API server.
 
-    Returns a plain string when the content is text-only, or a list of
-    ``{"type": "text"|"image_url", ...}`` parts when images are present.
+    Returns a plain string when the normalized content is text-only, or a list
+    of ``{"type": "text"|"image_url", ...}`` parts when images are present.
+    Files are resolved from profile-local ``file_id`` storage or inline
+    ``file_data``. Stored files retain their canonical path; inline bytes are
+    cached. Both become an image part or a text note containing the
+    agent-visible local path.
     The output shape is the native OpenAI Chat Completions vision format,
     which the agent pipeline accepts verbatim (OpenAI-wire providers) or
     converts (``_preprocess_anthropic_content`` for Anthropic).
 
     Raises ``ValueError`` with an OpenAI-style code on invalid input:
-      * ``unsupported_content_type`` — file/input_file/file_id parts, or
-        non-image ``data:`` URLs.
+      * ``unsupported_content_type`` — unknown content part types.
+      * ``file_not_found`` / ``file_corrupt`` — invalid profile-local file IDs.
+      * ``invalid_file_data`` — malformed, empty or incorrectly declared file
+        bytes.
       * ``invalid_image_url`` — missing URL or unsupported scheme.
       * ``invalid_content_part`` — malformed text/image objects.
 
@@ -592,8 +794,11 @@ def _normalize_multimodal_content(content: Any) -> Any:
         return _normalize_chat_content(content)
 
     items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
+    _validate_multimodal_file_limit([items])
+
     normalized_parts: List[Dict[str, Any]] = []
     text_accum_len = 0
+    total_inline_text_bytes = 0
 
     for part in items:
         if isinstance(part, str):
@@ -658,16 +863,23 @@ def _normalize_multimodal_content(content: Any) -> Any:
             continue
 
         if part_type in _FILE_PART_TYPES:
-            raise ValueError(
-                "unsupported_content_type:Inline image inputs are supported, "
-                "but uploaded files and document inputs are not supported on this endpoint."
+            normalized_file, inline_text_bytes = _materialize_file_part(
+                *_resolve_file_part(part)
             )
+            total_inline_text_bytes += inline_text_bytes
+            if total_inline_text_bytes > MAX_TOTAL_INLINE_TEXT_BYTES:
+                raise ValueError(
+                    "inline_text_too_large:Combined inline text exceeds the "
+                    f"{MAX_TOTAL_INLINE_TEXT_BYTES} byte request limit."
+                )
+            normalized_parts.append(normalized_file)
+            continue
 
         # Unknown part type — reject explicitly so clients get a clear error
         # instead of a silently dropped turn.
         raise ValueError(
             f"unsupported_content_type:Unsupported content part type {raw_type!r}. "
-            "Only text and image_url/input_image parts are supported."
+            "Only text, image_url/input_image and file/input_file parts are supported."
         )
 
     if not normalized_parts:
@@ -682,8 +894,26 @@ def _normalize_multimodal_content(content: Any) -> Any:
     return normalized_parts
 
 
+def _content_contains_inline_file(content: Any) -> bool:
+    """Return whether content contains work that must be offloaded from aiohttp."""
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(part, dict)
+        and str(part.get("type") or "").strip().lower() in _FILE_PART_TYPES
+        for part in content
+    )
+
+
+async def _normalize_request_multimodal_content(content: Any) -> Any:
+    """Normalize request content without decoding or caching files on the event loop."""
+    if _content_contains_inline_file(content):
+        return await asyncio.to_thread(_normalize_multimodal_content, content)
+    return _normalize_multimodal_content(content)
+
+
 def _content_has_visible_payload(content: Any) -> bool:
-    """True when content has any text or image attachment.  Used to reject empty turns."""
+    """True when content has text or an attachment. Used to reject empty turns."""
     if isinstance(content, str):
         return bool(content.strip())
     if isinstance(content, list):
@@ -692,7 +922,7 @@ def _content_has_visible_payload(content: Any) -> bool:
                 ptype = str(part.get("type") or "").strip().lower()
                 if ptype in _TEXT_PART_TYPES and str(part.get("text") or "").strip():
                     return True
-                if ptype in _IMAGE_PART_TYPES:
+                if ptype in _IMAGE_PART_TYPES or ptype in _FILE_PART_TYPES:
                     return True
     return False
 
@@ -811,7 +1041,9 @@ def _clear_turn_process_ownership(agent: Any) -> None:
     agent._gateway_turn_process_epoch = None
 
 
-def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") -> tuple[Any, Optional["web.Response"]]:
+async def _session_chat_user_message(
+    body: Dict[str, Any], *, param: str = "message"
+) -> tuple[Any, Optional["web.Response"]]:
     """Parse and normalize session chat ``message`` / ``input`` like chat completions."""
     user_message = body.get("message") or body.get("input")
     if not _content_has_visible_payload(user_message):
@@ -820,7 +1052,7 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
             status=400,
         )
     try:
-        return _normalize_multimodal_content(user_message), None
+        return await _normalize_request_multimodal_content(user_message), None
     except ValueError as exc:
         return None, _multimodal_validation_error(exc, param=param)
 
@@ -2137,6 +2369,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/health/detailed", self._handle_health_detailed),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
+            ("GET", "/v1/files", self._handle_list_files),
+            ("POST", "/v1/files", self._handle_create_file),
+            ("GET", "/v1/files/{file_id}", self._handle_get_file),
+            ("GET", "/v1/files/{file_id}/content", self._handle_get_file_content),
+            ("DELETE", "/v1/files/{file_id}", self._handle_delete_file),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("GET", "/v1/skills", self._handle_skills),
@@ -3185,6 +3422,240 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
         })
 
+    @staticmethod
+    def _files_api_error(
+        message: str,
+        *,
+        status: int,
+        code: str,
+        param: Optional[str] = None,
+    ) -> "web.Response":
+        return web.json_response(
+            _openai_error(message, code=code, param=param),
+            status=status,
+        )
+
+    async def _handle_create_file(self, request: "web.Request") -> "web.Response":
+        """POST /v1/files — stream one multipart upload into the active profile."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not request.content_type.startswith("multipart/"):
+            return self._files_api_error(
+                "Files must be uploaded as multipart/form-data.",
+                status=400,
+                code="invalid_request_error",
+                param="file",
+            )
+
+        store = APIFileStore()
+        staged = None
+        filename = "attachment.bin"
+        content_type = "application/octet-stream"
+        purpose = "user_data"
+        size = 0
+        try:
+            reader = await request.multipart()
+            while True:
+                field = await reader.next()
+                if field is None:
+                    break
+                if field.name == "purpose":
+                    purpose = (await field.text()).strip() or "user_data"
+                    continue
+                if field.name != "file":
+                    await field.release()
+                    continue
+                if staged is not None:
+                    raise ValueError("invalid_request_error:Upload exactly one file per request.")
+
+                staged = await asyncio.to_thread(store.stage)
+                filename = field.filename or filename
+                content_type = field.headers.get("Content-Type", content_type)
+                handle = staged.content_path.open("r+b")
+                try:
+                    while True:
+                        chunk = await field.read_chunk(1024 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_API_FILE_BYTES:
+                            raise ValueError(
+                                "file_too_large:File exceeds the "
+                                f"{MAX_API_FILE_BYTES // (1024 * 1024)} MiB limit."
+                            )
+                        await asyncio.to_thread(handle.write, chunk)
+                finally:
+                    await asyncio.to_thread(handle.close)
+
+            if staged is None:
+                raise ValueError("invalid_request_error:A multipart field named 'file' is required.")
+            if size == 0:
+                raise ValueError("invalid_request_error:The uploaded file must not be empty.")
+            if purpose != "user_data":
+                raise ValueError("invalid_purpose:Only purpose='user_data' is supported.")
+
+            record = await asyncio.to_thread(
+                store.commit,
+                staged,
+                filename=filename,
+                purpose=purpose,
+                content_type=content_type,
+                size=size,
+            )
+            staged = None
+            return web.json_response(record.as_api_dict())
+        except ValueError as exc:
+            raw = str(exc)
+            code, separator, message = raw.partition(":")
+            if not separator:
+                code, message = "invalid_request_error", raw
+            status = 413 if code == "file_too_large" else 400
+            param = "purpose" if code == "invalid_purpose" else "file"
+            return self._files_api_error(message, status=status, code=code, param=param)
+        except (OSError, APIFileCorruptError):
+            logger.exception("[%s] Failed to persist Files API upload", self.name)
+            return self._files_api_error(
+                "Failed to store the uploaded file.",
+                status=500,
+                code="file_storage_error",
+                param="file",
+            )
+        except web.HTTPRequestEntityTooLarge:
+            raise
+        except (AssertionError, web.HTTPBadRequest):
+            return self._files_api_error(
+                "Invalid multipart upload.",
+                status=400,
+                code="invalid_request_error",
+                param="file",
+            )
+        except Exception:
+            logger.exception("[%s] Failed to receive Files API upload", self.name)
+            return self._files_api_error(
+                "Failed to receive the uploaded file.",
+                status=500,
+                code="file_upload_error",
+                param="file",
+            )
+        finally:
+            # Keep cancellation and client disconnects from leaving partial
+            # uploads behind. A staging directory contains only two files, so
+            # this unlink is bounded and safe to do while unwinding the task.
+            store.discard(staged)
+
+    async def _handle_list_files(self, request: "web.Request") -> "web.Response":
+        """GET /v1/files — list files in the active profile."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            limit = int(request.query.get("limit", "100"))
+        except ValueError:
+            return self._files_api_error(
+                "limit must be an integer.",
+                status=400,
+                code="invalid_request_error",
+                param="limit",
+            )
+        if not 1 <= limit <= 1000:
+            return self._files_api_error(
+                "limit must be between 1 and 1000.",
+                status=400,
+                code="invalid_request_error",
+                param="limit",
+            )
+
+        records = await asyncio.to_thread(APIFileStore().list)
+        return web.json_response(
+            {
+                "object": "list",
+                "data": [record.as_api_dict() for record in records[:limit]],
+                "has_more": len(records) > limit,
+            }
+        )
+
+    async def _get_api_file_record(
+        self,
+        request: "web.Request",
+    ) -> tuple[Optional[Any], Optional["web.Response"]]:
+        file_id = request.match_info.get("file_id", "")
+        try:
+            record = await asyncio.to_thread(APIFileStore().get, file_id)
+        except APIFileNotFoundError:
+            return None, self._files_api_error(
+                f"No file found with id {file_id!r}.",
+                status=404,
+                code="file_not_found",
+                param="file_id",
+            )
+        except APIFileCorruptError:
+            logger.error("[%s] Stored Files API record %r is corrupt", self.name, file_id)
+            return None, self._files_api_error(
+                "The stored file is unavailable.",
+                status=500,
+                code="file_storage_error",
+                param="file_id",
+            )
+        return record, None
+
+    async def _handle_get_file(self, request: "web.Request") -> "web.Response":
+        """GET /v1/files/{file_id} — retrieve profile-local file metadata."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        record, error = await self._get_api_file_record(request)
+        if error:
+            return error
+        return web.json_response(record.as_api_dict())
+
+    async def _handle_get_file_content(self, request: "web.Request") -> "web.Response":
+        """GET /v1/files/{file_id}/content — stream the original bytes."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        record, error = await self._get_api_file_record(request)
+        if error:
+            return error
+
+        fallback_name = re.sub(r"[^A-Za-z0-9._-]", "_", record.filename) or "attachment.bin"
+        disposition = (
+            f'attachment; filename="{fallback_name}"; '
+            f"filename*=UTF-8''{quote(record.filename, safe='')}"
+        )
+        return web.FileResponse(
+            record.content_path,
+            headers={
+                "Content-Type": record.content_type,
+                "Content-Disposition": disposition,
+            },
+        )
+
+    async def _handle_delete_file(self, request: "web.Request") -> "web.Response":
+        """DELETE /v1/files/{file_id} — delete a file in the active profile."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        file_id = request.match_info.get("file_id", "")
+        try:
+            await asyncio.to_thread(APIFileStore().delete, file_id)
+        except APIFileNotFoundError:
+            return self._files_api_error(
+                f"No file found with id {file_id!r}.",
+                status=404,
+                code="file_not_found",
+                param="file_id",
+            )
+        except OSError:
+            logger.exception("[%s] Failed to delete Files API record %r", self.name, file_id)
+            return self._files_api_error(
+                "Failed to delete the stored file.",
+                status=500,
+                code="file_storage_error",
+                param="file_id",
+            )
+        return web.json_response({"id": file_id, "object": "file", "deleted": True})
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — list hermes-agent and any configured model_routes aliases.
 
@@ -3304,6 +3775,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions_streaming": True,
                 "responses_api": True,
                 "responses_streaming": True,
+                "files_api": True,
+                "input_file_id": True,
                 "compaction_status_events": True,
                 "run_submission": True,
                 "run_status": True,
@@ -3334,6 +3807,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 "health": {"method": "GET", "path": "/health"},
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
+                "files": {"method": "POST", "path": "/v1/files"},
+                "file": {"method": "GET", "path": "/v1/files/{file_id}"},
+                "file_content": {
+                    "method": "GET",
+                    "path": "/v1/files/{file_id}/content",
+                },
+                "file_delete": {
+                    "method": "DELETE",
+                    "path": "/v1/files/{file_id}",
+                },
                 "model_options": {"method": "GET", "path": "/api/model/options"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
@@ -3948,7 +4431,7 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        user_message, err = _session_chat_user_message(body)
+        user_message, err = await _session_chat_user_message(body)
         if err is not None:
             return err
         system_prompt = body.get("system_message") or body.get("instructions")
@@ -4069,7 +4552,7 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        user_message, err = _session_chat_user_message(body)
+        user_message, err = await _session_chat_user_message(body)
         if err is not None:
             return err
         system_prompt = body.get("system_message") or body.get("instructions")
@@ -4488,6 +4971,15 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
 
+        try:
+            _validate_multimodal_file_limit([
+                msg.get("content", "")
+                for msg in messages
+                if isinstance(msg, dict) and msg.get("role") in {"user", "assistant"}
+            ])
+        except ValueError as exc:
+            return _multimodal_validation_error(exc, param="messages")
+
         for idx, msg in enumerate(messages):
             role = msg.get("role", "")
             raw_content = msg.get("content", "")
@@ -4501,7 +4993,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     system_prompt = system_prompt + "\n" + content
             elif role in {"user", "assistant"}:
                 try:
-                    content = _normalize_multimodal_content(raw_content)
+                    content = await _normalize_request_multimodal_content(raw_content)
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
                 conversation_messages.append({"role": role, "content": content})
@@ -5794,21 +6286,19 @@ class APIServerAdapter(BasePlatformAdapter):
             previous_response_id = self._response_store.get_conversation(conversation)
             # No error if conversation doesn't exist yet — it's a new conversation
 
-        # Normalize input to message list
-        input_messages: List[Dict[str, Any]] = []
+        # Parse every request-owned message before materializing attachments so
+        # the request-wide file limit is enforced without partial cache writes.
+        raw_input_messages: list[tuple[int, Any, Any]] = []
         if isinstance(raw_input, str):
-            input_messages = [{"role": "user", "content": raw_input}]
+            raw_input_messages = [(0, "user", raw_input)]
         elif isinstance(raw_input, list):
             for idx, item in enumerate(raw_input):
                 if isinstance(item, str):
-                    input_messages.append({"role": "user", "content": item})
+                    raw_input_messages.append((idx, "user", item))
                 elif isinstance(item, dict):
-                    role = item.get("role", "user")
-                    try:
-                        content = _normalize_multimodal_content(item.get("content", ""))
-                    except ValueError as exc:
-                        return _multimodal_validation_error(exc, param=f"input[{idx}].content")
-                    input_messages.append({"role": role, "content": content})
+                    raw_input_messages.append(
+                        (idx, item.get("role", "user"), item.get("content", ""))
+                    )
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
 
@@ -5816,7 +6306,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # This lets stateless clients supply their own history instead of
         # relying on server-side response chaining via previous_response_id.
         # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, Any]] = []
+        raw_history_entries: list[tuple[int, Dict[str, Any]]] = []
         raw_history = body.get("conversation_history")
         if raw_history:
             if not isinstance(raw_history, list):
@@ -5838,20 +6328,40 @@ class APIServerAdapter(BasePlatformAdapter):
                         ),
                         status=400,
                     )
-                try:
-                    entry_content = _normalize_multimodal_content(entry["content"])
-                except ValueError as exc:
-                    return _multimodal_validation_error(
-                        exc, param=f"conversation_history[{i}].content"
-                    )
-                conversation_history.append({
-                    "role": str(entry["role"]),
-                    "content": entry_content,
-                })
-            if previous_response_id:
-                logger.debug(
-                    "Both conversation_history and previous_response_id provided; using conversation_history"
+                raw_history_entries.append((i, entry))
+
+        try:
+            _validate_multimodal_file_limit(
+                [content for _, _, content in raw_input_messages]
+                + [entry["content"] for _, entry in raw_history_entries]
+            )
+        except ValueError as exc:
+            return _multimodal_validation_error(exc, param="input")
+
+        input_messages: List[Dict[str, Any]] = []
+        for idx, role, raw_content in raw_input_messages:
+            try:
+                content = await _normalize_request_multimodal_content(raw_content)
+            except ValueError as exc:
+                return _multimodal_validation_error(exc, param=f"input[{idx}].content")
+            input_messages.append({"role": role, "content": content})
+
+        conversation_history: List[Dict[str, Any]] = []
+        for i, entry in raw_history_entries:
+            try:
+                entry_content = await _normalize_request_multimodal_content(entry["content"])
+            except ValueError as exc:
+                return _multimodal_validation_error(
+                    exc, param=f"conversation_history[{i}].content"
                 )
+            conversation_history.append({
+                "role": str(entry["role"]),
+                "content": entry_content,
+            })
+        if raw_history and previous_response_id:
+            logger.debug(
+                "Both conversation_history and previous_response_id provided; using conversation_history"
+            )
 
         stored_session_id = None
         if not conversation_history and previous_response_id:

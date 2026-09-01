@@ -2158,6 +2158,36 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
     return str(filepath)
 
 
+def build_document_context_note(
+    display_name: str,
+    agent_path: str,
+    mime_type: str,
+    *,
+    content_inlined: Optional[bool] = None,
+) -> str:
+    """Describe a cached document to the agent using the gateway wording."""
+    is_text = (mime_type or "").startswith("text/")
+    if content_inlined is True or (content_inlined is None and is_text):
+        return (
+            f"[The user sent a text document: '{display_name}'. "
+            f"Its content has been included below. "
+            f"The file is also saved at: {agent_path}]"
+        )
+    if is_text:
+        return (
+            f"[The user sent a text document: '{display_name}'. It is saved at: {agent_path}. "
+            f"Its content is not inlined because it is too large or is not valid UTF-8. "
+            f"Read it from the saved path with the file or terminal tools before answering.]"
+        )
+    return (
+        f"[The user sent a document: '{display_name}'. It is saved at: {agent_path}. "
+        f"Its text is not inlined here (it's a binary format such as PDF or DOCX). "
+        f"To read it, extract the document's text yourself — for example with the "
+        f"terminal tool or the ocr-and-documents skill — before answering, instead "
+        f"of asking the user to paste the contents.]"
+    )
+
+
 def cleanup_document_cache(max_age_hours: int = 24) -> int:
     """
     Delete cached documents older than *max_age_hours*.
@@ -2192,6 +2222,17 @@ class CachedMedia:
         return f"[{self.kind} '{self.display_name}' saved at: {self.path}]"
 
 
+@dataclass(frozen=True)
+class _MediaClassification:
+    """Shared classification result for copied and already-stored media."""
+
+    kind: str
+    cache_extension: str
+    media_type: str
+    display_name: str
+    cache_filename: str
+
+
 def _resolve_media_ext(filename: str, mime_type: str) -> str:
     """Best-effort file extension from filename, then MIME fallback."""
     if filename:
@@ -2212,6 +2253,64 @@ def _resolve_media_ext(filename: str, mime_type: str) -> str:
     return ""
 
 
+def _classify_media_bytes(
+    *,
+    filename: str,
+    mime_type: str,
+    default_kind: Optional[str],
+) -> _MediaClassification:
+    """Classify attachment metadata without deciding where bytes are stored."""
+    ext = _resolve_media_ext(filename, mime_type)
+    mime = (mime_type or "").lower()
+    display = re.sub(r"[^\w.\- ]", "_", filename) if filename else (ext.lstrip(".") or "file")
+
+    is_image = (
+        mime.startswith("image/")
+        or ext in SUPPORTED_IMAGE_DOCUMENT_TYPES
+        or default_kind == "image"
+    )
+    is_video = mime.startswith("video/") or ext in SUPPORTED_VIDEO_TYPES or default_kind == "video"
+    is_audio = mime.startswith("audio/") or ext in _AUDIO_EXTS or default_kind == "audio"
+
+    if is_image:
+        cache_ext = ext if ext in SUPPORTED_IMAGE_DOCUMENT_TYPES else ".jpg"
+        output_mime = (
+            mime
+            if mime.startswith("image/")
+            else SUPPORTED_IMAGE_DOCUMENT_TYPES.get(cache_ext, "image/jpeg")
+        )
+        return _MediaClassification("image", cache_ext, output_mime, display, filename)
+
+    if is_video:
+        cache_ext = ext if ext in SUPPORTED_VIDEO_TYPES else ".mp4"
+        return _MediaClassification(
+            "video",
+            cache_ext,
+            SUPPORTED_VIDEO_TYPES.get(cache_ext, "video/mp4"),
+            display,
+            filename,
+        )
+
+    if is_audio:
+        cache_ext = ext if ext in _AUDIO_EXTS else ".ogg"
+        output_mime = mime if mime.startswith("audio/") else _AUDIO_MIME_TYPES[cache_ext]
+        return _MediaClassification("audio", cache_ext, output_mime, display, filename)
+
+    fallback_name = filename or (f"document{ext}" if ext else "document.bin")
+    output_mime = (
+        SUPPORTED_DOCUMENT_TYPES[ext]
+        if ext in SUPPORTED_DOCUMENT_TYPES
+        else (mime if mime else "application/octet-stream")
+    )
+    return _MediaClassification(
+        "document",
+        ext,
+        output_mime,
+        display or fallback_name,
+        fallback_name,
+    )
+
+
 def cache_media_bytes(
     data: bytes,
     *,
@@ -2230,37 +2329,41 @@ def cache_media_bytes(
     """
     from tools.credential_files import to_agent_visible_cache_path
 
-    ext = _resolve_media_ext(filename, mime_type)
-    mime = (mime_type or "").lower()
-    display = re.sub(r"[^\w.\- ]", "_", filename) if filename else (ext.lstrip(".") or "file")
-
-    is_image = (
-        mime.startswith("image/")
-        or ext in SUPPORTED_IMAGE_DOCUMENT_TYPES
-        or default_kind == "image"
+    media = _classify_media_bytes(
+        filename=filename,
+        mime_type=mime_type,
+        default_kind=default_kind,
     )
-    is_video = mime.startswith("video/") or ext in SUPPORTED_VIDEO_TYPES or default_kind == "video"
-    is_audio = mime.startswith("audio/") or ext in _AUDIO_EXTS or default_kind == "audio"
 
-    if is_image:
-        img_ext = ext if ext in SUPPORTED_IMAGE_DOCUMENT_TYPES else ".jpg"
+    if media.kind == "image":
         try:
-            path = cache_image_from_bytes(data, ext=img_ext)
+            path = cache_image_from_bytes(data, ext=media.cache_extension)
         except ValueError:
             return None
-        out_mime = mime if mime.startswith("image/") else SUPPORTED_IMAGE_DOCUMENT_TYPES.get(img_ext, "image/jpeg")
-        return CachedMedia(to_agent_visible_cache_path(path), out_mime, "image", display)
+        return CachedMedia(
+            to_agent_visible_cache_path(path),
+            media.media_type,
+            media.kind,
+            media.display_name,
+        )
 
-    if is_video:
-        vid_ext = ext if ext in SUPPORTED_VIDEO_TYPES else ".mp4"
-        path = cache_video_from_bytes(data, ext=vid_ext)
-        return CachedMedia(to_agent_visible_cache_path(path), SUPPORTED_VIDEO_TYPES.get(vid_ext, "video/mp4"), "video", display)
+    if media.kind == "video":
+        path = cache_video_from_bytes(data, ext=media.cache_extension)
+        return CachedMedia(
+            to_agent_visible_cache_path(path),
+            media.media_type,
+            media.kind,
+            media.display_name,
+        )
 
-    if is_audio:
-        aud_ext = ext if ext in _AUDIO_EXTS else ".ogg"
-        path = cache_audio_from_bytes(data, ext=aud_ext)
-        out_mime = mime if mime.startswith("audio/") else _AUDIO_MIME_TYPES[aud_ext]
-        return CachedMedia(to_agent_visible_cache_path(path), out_mime, "audio", display)
+    if media.kind == "audio":
+        path = cache_audio_from_bytes(data, ext=media.cache_extension)
+        return CachedMedia(
+            to_agent_visible_cache_path(path),
+            media.media_type,
+            media.kind,
+            media.display_name,
+        )
 
     # Any other file type is cached and surfaced to the agent as a local path
     # so it can be inspected with terminal / read_file / etc. Authorization to
@@ -2269,13 +2372,51 @@ def cache_media_bytes(
     # uploads. Known extensions keep their precise MIME; everything else is
     # tagged application/octet-stream (or the caller-supplied MIME) so the
     # agent knows it's an arbitrary file and reaches for terminal tools.
-    fallback_name = filename or (f"document{ext}" if ext else "document.bin")
-    path = cache_document_from_bytes(data, fallback_name)
-    if ext in SUPPORTED_DOCUMENT_TYPES:
-        out_mime = SUPPORTED_DOCUMENT_TYPES[ext]
-    else:
-        out_mime = mime if mime else "application/octet-stream"
-    return CachedMedia(to_agent_visible_cache_path(path), out_mime, "document", display or fallback_name)
+    path = cache_document_from_bytes(data, media.cache_filename)
+    return CachedMedia(
+        to_agent_visible_cache_path(path),
+        media.media_type,
+        media.kind,
+        media.display_name,
+    )
+
+
+def reference_media_file(
+    path: str | Path,
+    data: bytes,
+    *,
+    filename: str = "",
+    mime_type: str = "",
+    default_kind: Optional[str] = None,
+) -> Optional[CachedMedia]:
+    """Describe an existing attachment without creating another cached copy."""
+    from tools.credential_files import to_agent_visible_cache_path
+
+    file_path = Path(path)
+    if not file_path.is_file() or file_path.is_symlink():
+        return None
+
+    media = _classify_media_bytes(
+        filename=filename,
+        mime_type=mime_type,
+        default_kind=default_kind,
+    )
+    if media.kind == "image":
+        try:
+            validate_inbound_media_size(len(data), media_type="image")
+        except ValueError:
+            return None
+        if not _looks_like_image(data):
+            return None
+    elif media.kind in {"audio", "video"}:
+        validate_inbound_media_size(len(data), media_type=media.kind)
+
+    return CachedMedia(
+        to_agent_visible_cache_path(str(file_path)),
+        media.media_type,
+        media.kind,
+        media.display_name,
+    )
 
 
 class MessageType(Enum):

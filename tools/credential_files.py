@@ -409,6 +409,7 @@ def iter_skills_files(
 # The cache subdirectories that should be mirrored into remote backends.
 # Each tuple is (new_subpath, old_name) matching hermes_constants.get_hermes_dir().
 _CACHE_DIRS: list[tuple[str, str]] = [
+    ("cache/api_files", "cache/api_files"),
     ("cache/documents", "document_cache"),
     ("cache/images", "image_cache"),
     ("cache/audio", "audio_cache"),
@@ -588,5 +589,4 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-
 

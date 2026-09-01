@@ -1,6 +1,7 @@
 """Focused tests for API server session-control endpoints."""
 
 import asyncio
+import base64
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -51,6 +52,55 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     return app
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["chat", "chat/stream"])
+async def test_session_chat_routes_accept_file_only_message(
+    route,
+    adapter,
+    session_db,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session_id = session_db.create_session(
+        f"file-only-{route.replace('/', '-')}",
+        "api_server",
+    )
+    encoded = base64.b64encode(b"file-only session input").decode("ascii")
+    mock_run = AsyncMock(
+        return_value=(
+            {
+                "final_response": "ok",
+                "session_id": session_id,
+                "messages": [{"role": "assistant", "content": "ok"}],
+            },
+            {"total_tokens": 1},
+        )
+    )
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/api/sessions/{session_id}/{route}",
+                json={
+                    "message": [
+                        {
+                            "type": "input_file",
+                            "filename": "only.txt",
+                            "file_data": f"data:text/plain;base64,{encoded}",
+                        }
+                    ]
+                },
+            )
+            body = await response.text()
+
+    assert response.status == 200, body
+    user_message = mock_run.await_args.kwargs["user_message"]
+    assert "The user sent a text document: 'only.txt'" in user_message
+    assert "[Content of only.txt]:\nfile-only session input" in user_message
 
 
 @pytest.mark.asyncio

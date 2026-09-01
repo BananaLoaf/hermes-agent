@@ -161,3 +161,69 @@ async def test_profile_middleware_binds_auth_before_handler(
         assert (await accepted.json())["profile"] == "worker"
 
 
+@pytest.mark.asyncio
+async def test_files_api_cannot_resolve_another_profiles_file_id(
+    adapter, tmp_path, monkeypatch
+):
+    from aiohttp import FormData, web
+    from aiohttp.test_utils import TestClient, TestServer
+    from gateway.config import GatewayConfig
+
+    default_home = tmp_path / "profiles" / "default"
+    worker_home = tmp_path / "profiles" / "worker"
+    default_home.mkdir(parents=True)
+    worker_home.mkdir(parents=True)
+    default_key = "d" * 32
+    worker_key = "w" * 32
+    (worker_home / ".env").write_text(
+        f"API_SERVER_KEY={worker_key}\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    adapter._api_key = default_key
+    adapter.gateway_runner = type(
+        "_Runner", (), {"config": GatewayConfig(multiplex_profiles=True)}
+    )()
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex, profile_allowlist=None: [
+            ("default", default_home),
+            ("worker", worker_home),
+        ],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: default_home if name == "default" else worker_home,
+    )
+    ss.set_multiplex_active(True)
+
+    app = web.Application(middlewares=[adapter._make_profile_prefix_middleware()])
+    app.router.add_post("/v1/files", adapter._handle_create_file)
+    app.router.add_get("/v1/files/{file_id}", adapter._handle_get_file)
+    app.router.add_post("/p/{profile}/v1/files", adapter._handle_create_file)
+    app.router.add_get("/p/{profile}/v1/files/{file_id}", adapter._handle_get_file)
+
+    form = FormData()
+    form.add_field("purpose", "user_data")
+    form.add_field("file", b"worker only", filename="private.txt", content_type="text/plain")
+
+    async with TestClient(TestServer(app)) as client:
+        uploaded = await client.post(
+            "/p/worker/v1/files",
+            data=form,
+            headers={"Authorization": f"Bearer {worker_key}"},
+        )
+        assert uploaded.status == 200, await uploaded.text()
+        file_id = (await uploaded.json())["id"]
+
+        cross_profile = await client.get(
+            f"/v1/files/{file_id}",
+            headers={"Authorization": f"Bearer {default_key}"},
+        )
+        assert cross_profile.status == 404
+
+        own_profile = await client.get(
+            f"/p/worker/v1/files/{file_id}",
+            headers={"Authorization": f"Bearer {worker_key}"},
+        )
+        assert own_profile.status == 200
+
