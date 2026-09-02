@@ -2675,42 +2675,6 @@ class TestSessionIdHeader:
             assert call_kwargs["conversation_history"] == db_history
             assert call_kwargs["user_message"] == "new question"
 
-    @pytest.mark.asyncio
-    async def test_responses_uses_header_with_explicit_history(self, auth_adapter):
-        """Open WebUI's stable chat ID wins even when it sends full history."""
-        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
-        app = _create_app(auth_adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
-                mock_run.return_value = (
-                    mock_result,
-                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                )
-                resp = await cli.post(
-                    "/v1/responses",
-                    headers={
-                        "X-Hermes-Session-Id": "openwebui-chat-42",
-                        "Authorization": "Bearer sk-secret",
-                    },
-                    json={
-                        "model": "hermes-agent",
-                        "input": "new question",
-                        "conversation_history": [
-                            {"role": "user", "content": "old question"},
-                            {"role": "assistant", "content": "old answer"},
-                        ],
-                    },
-                )
-
-            assert resp.status == 200
-            assert resp.headers["X-Hermes-Session-Id"] == "openwebui-chat-42"
-            call_kwargs = mock_run.call_args.kwargs
-            assert call_kwargs["session_id"] == "openwebui-chat-42"
-            assert call_kwargs["conversation_history"] == [
-                {"role": "user", "content": "old question"},
-                {"role": "assistant", "content": "old answer"},
-            ]
-
 
 # ---------------------------------------------------------------------------
 # X-Hermes-Session-Key header (long-term memory scoping)

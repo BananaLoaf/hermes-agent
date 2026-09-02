@@ -3,7 +3,7 @@ OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
 - POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
-- POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id or X-Hermes-Session-Id; X-Hermes-Session-Key and opt-in X-Hermes-Events supported)
+- POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key and opt-in X-Hermes-Events supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
@@ -2356,41 +2356,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        return raw, None
-
-    def _parse_session_id_header(
-        self, request: "web.Request"
-    ) -> tuple[Optional[str], Optional["web.Response"]]:
-        """Extract and validate an optional ``X-Hermes-Session-Id``."""
-        raw = request.headers.get("X-Hermes-Session-Id", "").strip()
-        if not raw:
-            return None, None
-
-        if not self._api_key:
-            logger.warning(
-                "X-Hermes-Session-Id rejected: no API key configured. "
-                "Set API_SERVER_KEY to enable session continuity."
-            )
-            return None, web.json_response(
-                _openai_error(
-                    "X-Hermes-Session-Id requires API key authentication. "
-                    "Configure API_SERVER_KEY to enable this feature."
-                ),
-                status=403,
-            )
-
-        from gateway.session import _is_path_unsafe
-
-        if re.search(r'[\r\n\x00]', raw) or _is_path_unsafe(raw):
-            return None, web.json_response(
-                {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
-                status=400,
-            )
-        if len(raw) > self._MAX_SESSION_HEADER_LEN:
-            return None, web.json_response(
-                {"error": {"message": "Session ID too long", "type": "invalid_request_error"}},
-                status=400,
-            )
         return raw, None
 
     # ------------------------------------------------------------------
@@ -5278,10 +5243,37 @@ class APIServerAdapter(BasePlatformAdapter):
         # only allowed when the API key is configured and the request is
         # authenticated.  Without this gate, any unauthenticated client could
         # read arbitrary session history by guessing/enumerating session IDs.
-        provided_session_id, id_err = self._parse_session_id_header(request)
-        if id_err is not None:
-            return id_err
+        provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
         if provided_session_id:
+            if not self._api_key:
+                logger.warning(
+                    "Session continuation via X-Hermes-Session-Id rejected: "
+                    "no API key configured.  Set API_SERVER_KEY to enable "
+                    "session continuity."
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Session continuation requires API key authentication. "
+                        "Configure API_SERVER_KEY to enable this feature."
+                    ),
+                    status=403,
+                )
+            # Sanitize: reject control characters that could enable header
+            # injection, and path-traversal-shaped IDs that would escape the
+            # sessions directory when interpolated into on-disk artifact
+            # filenames (session snapshots, request dumps). Mirrors the native
+            # gateway's entry-boundary guard (gateway.session._is_path_unsafe).
+            from gateway.session import _is_path_unsafe
+            if re.search(r'[\r\n\x00]', provided_session_id) or _is_path_unsafe(provided_session_id):
+                return web.json_response(
+                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
+                    status=400,
+                )
+            if len(provided_session_id) > self._MAX_SESSION_HEADER_LEN:
+                return web.json_response(
+                    {"error": {"message": "Session ID too long", "type": "invalid_request_error"}},
+                    status=400,
+                )
             session_id = provided_session_id
             try:
                 db = await self._ensure_session_db_async()
@@ -6471,9 +6463,6 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
-        provided_session_id, id_err = self._parse_session_id_header(request)
-        if id_err is not None:
-            return id_err
 
         # Parse request body
         try:
@@ -6591,11 +6580,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if body.get("truncation") == "auto":
             conversation_history = _auto_truncate_response_history(conversation_history)
 
-        # A caller-provided ID is authoritative. This keeps clients such as
-        # Open WebUI on one Hermes/Langfuse session even when they send an
-        # explicit conversation_history on every Responses API request (which
-        # intentionally takes precedence over previous_response_id history).
-        session_id = provided_session_id or stored_session_id or str(uuid.uuid4())
+        # Reuse session from previous_response_id chain so the dashboard
+        # groups the entire conversation under one session entry.
+        session_id = stored_session_id or str(uuid.uuid4())
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
         route = self._resolve_route(body.get("model"))
