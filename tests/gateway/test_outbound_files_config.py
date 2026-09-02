@@ -10,7 +10,6 @@ from gateway.outbound_files import (
     OutboundFileProvider,
     OutboundFilesConfig,
     OutboundFilesConfigError,
-    OutboundMediaStreamBuffer,
     UploadedFile,
     ZiplineOutboundFileProvider,
     _content_type_for_path,
@@ -236,8 +235,7 @@ class RecordingProvider(OutboundFileProvider):
 
 
 @pytest.mark.asyncio
-async def test_exporter_selects_expiry_and_markdown_by_file_kind(tmp_path, monkeypatch):
-    monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+async def test_exporter_selects_expiry_and_markdown_by_file_kind(tmp_path):
     image = tmp_path / "chart.png"
     svg = tmp_path / "diagram.svg"
     document = tmp_path / "quarterly report.pdf"
@@ -254,17 +252,18 @@ async def test_exporter_selects_expiry_and_markdown_by_file_kind(tmp_path, monke
     )
     exporter = OutboundFileExporter(config, provider)
 
-    rendered = await exporter.export_media_text(
-        f"Chart:\nMEDIA:{image}\nDiagram:\nMEDIA:{svg}\nReport:\nMEDIA:{document}"
-    )
+    rendered = [
+        await exporter.export_file(image),
+        await exporter.export_file(svg),
+        await exporter.export_file(document),
+    ]
 
-    assert f"![chart.png](https://files.example.com/u/chart.png)" in rendered
-    assert f"![diagram.svg](https://files.example.com/u/diagram.svg)" in rendered
+    assert "![chart.png](https://files.example.com/u/chart.png)" in rendered
+    assert "![diagram.svg](https://files.example.com/u/diagram.svg)" in rendered
     assert (
         "[Download quarterly report.pdf]"
         "(https://files.example.com/u/quarterly%20report.pdf)"
     ) in rendered
-    assert "MEDIA:" not in rendered
     assert provider.uploads == [(image, None), (svg, None), (document, "7d")]
 
 
@@ -331,251 +330,6 @@ async def test_exporter_renders_configured_timezone_variables(tmp_path, monkeypa
         "2026-09-01|12:34|2026-09-01 12:34|"
         "https://files.example.com/u/report.pdf"
     )
-
-
-@pytest.mark.asyncio
-async def test_exporter_handles_quoted_unknown_extension_and_hides_invalid_path(
-    tmp_path, monkeypatch
-):
-    monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
-    artifact = tmp_path / "custom artifact.unknown"
-    artifact.write_bytes(b"artifact")
-    missing_file = tmp_path / "missing.unknown"
-    missing_image = tmp_path / "missing.png"
-    provider = RecordingProvider()
-    config = OutboundFilesConfig.from_dict(
-        {
-            "provider": "test",
-            "file_expiry": "7d",
-            "image_expiry": None,
-            "templates": {
-                "invalid_image": "IMAGE UNAVAILABLE",
-                "invalid_file": "FILE UNAVAILABLE",
-            },
-        }
-    )
-    exporter = OutboundFileExporter(config, provider)
-
-    rendered = await exporter.export_media_text(
-        f'MEDIA:"{artifact}"\nMEDIA:"{missing_file}"\nMEDIA:"{missing_image}"'
-    )
-
-    assert "https://files.example.com/u/custom%20artifact.unknown" in rendered
-    assert str(artifact) not in rendered
-    assert str(missing_file) not in rendered
-    assert str(missing_image) not in rendered
-    assert "IMAGE UNAVAILABLE" in rendered
-    assert "FILE UNAVAILABLE" in rendered
-    assert provider.uploads == [(artifact, "7d")]
-
-
-def test_stream_buffer_never_emits_a_split_media_marker():
-    buffer = OutboundMediaStreamBuffer()
-
-    assert buffer.feed("Ready\nMED") == "Ready\n"
-    assert buffer.feed("IA:/tmp/partial-") == ""
-    assert buffer.feed("report") == ""
-    assert buffer.feed(".pdf\nDone") == "MEDIA:/tmp/partial-report.pdf\nDone"
-    assert buffer.finish("Ready\nMEDIA:/tmp/partial-report.pdf\nDone") == ""
-
-
-def test_stream_buffer_releases_quoted_path_at_closing_quote():
-    buffer = OutboundMediaStreamBuffer()
-
-    assert buffer.feed('MEDIA:"/tmp/partial') == ""
-    assert buffer.feed(' report.custom"') == 'MEDIA:"/tmp/partial report.custom"'
-    assert buffer.finish('MEDIA:"/tmp/partial report.custom"') == ""
-
-
-@pytest.mark.asyncio
-async def test_responses_stream_exports_split_media_marker_without_path_leak(
-    tmp_path, monkeypatch
-):
-    import asyncio
-    import time
-    import uuid
-
-    import gateway.platforms.api_server as api_mod
-    from gateway.config import PlatformConfig
-    from gateway.platforms.api_server import APIServerAdapter
-
-    monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
-    document = tmp_path / "quarterly report.pdf"
-    document.write_bytes(b"pdf")
-    provider = RecordingProvider()
-    config = OutboundFilesConfig.from_dict(
-        {
-            "provider": "test",
-            "file_expiry": "7d",
-            "image_expiry": None,
-        }
-    )
-    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
-    adapter._outbound_files = OutboundFileExporter(config, provider)
-
-    written_payloads = []
-
-    class FakeStreamResponse:
-        async def prepare(self, _request):
-            return None
-
-        async def write(self, payload):
-            written_payloads.append(payload)
-
-    stream_q = api_mod.ThreadSafeAsyncQueue()
-    path_text = str(document)
-    path_split = path_text.rfind(" ")
-    assert path_split > 0
-    stream_q.put_nowait("Ready\nMED")
-    stream_q.put_nowait(f"IA:{path_text[:path_split]}")
-    stream_q.put_nowait(path_text[path_split:])
-    stream_q.put_nowait(" Uploaded.")
-    stream_q.put_nowait(None)
-
-    allow_agent_to_finish = asyncio.Event()
-
-    async def agent_result():
-        await allow_agent_to_finish.wait()
-        return (
-            {
-                "final_response": f"Ready\nMEDIA:{document} Uploaded.",
-                "messages": [],
-            },
-            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-        )
-
-    request = MagicMock()
-    request.headers = {}
-    response_id = f"resp_{uuid.uuid4().hex[:28]}"
-    with patch.object(api_mod.web, "StreamResponse", return_value=FakeStreamResponse()):
-        stream_task = asyncio.create_task(
-            adapter._write_sse_responses(
-                request=request,
-                response_id=response_id,
-                model="hermes-agent",
-                created_at=int(time.time()),
-                stream_q=stream_q,
-                agent_task=asyncio.create_task(agent_result()),
-                agent_ref=[None],
-                conversation_history=[],
-                user_message="create report",
-                instructions=None,
-                conversation=None,
-                store=False,
-                session_id="session-1",
-            )
-        )
-        for _ in range(20):
-            if provider.uploads:
-                break
-            await asyncio.sleep(0.01)
-        assert provider.uploads == [(document, "7d")]
-        assert not stream_task.done()
-        allow_agent_to_finish.set()
-        await stream_task
-
-    wire_output = b"".join(written_payloads).decode("utf-8")
-    assert str(document) not in wire_output
-    assert "https://files.example.com/u/quarterly%20report.pdf" in wire_output
-    assert provider.uploads == [(document, "7d")]
-
-
-@pytest.mark.asyncio
-async def test_session_transcript_reuses_exported_final_without_uploading_twice(
-    tmp_path, monkeypatch
-):
-    from gateway.config import PlatformConfig
-    from gateway.platforms.api_server import APIServerAdapter
-
-    monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
-    document = tmp_path / "report.pdf"
-    document.write_bytes(b"pdf")
-    raw = f"Done\nMEDIA:{document}"
-    provider = RecordingProvider()
-    config = OutboundFilesConfig.from_dict(
-        {
-            "provider": "test",
-            "file_expiry": "7d",
-            "image_expiry": None,
-        }
-    )
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
-    adapter._outbound_files = OutboundFileExporter(config, provider)
-    exported_final = await adapter._export_outbound_media(raw)
-
-    original = [{"role": "assistant", "content": raw}]
-    exported = await adapter._export_transcript_media(
-        original,
-        raw_final_response=raw,
-        exported_final_response=exported_final,
-    )
-
-    assert str(document) not in exported[0]["content"]
-    assert exported[0]["content"] == exported_final
-    assert original[0]["content"] == raw
-    assert provider.uploads == [(document, "7d")]
-
-
-@pytest.mark.asyncio
-async def test_runs_stream_exports_media_without_local_path_leak(tmp_path, monkeypatch):
-    import asyncio
-
-    from aiohttp import web
-    from aiohttp.test_utils import TestClient, TestServer
-    from gateway.config import PlatformConfig
-    from gateway.platforms.api_server import APIServerAdapter
-
-    monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
-    document = tmp_path / "report.pdf"
-    document.write_bytes(b"pdf")
-    raw = f"Ready\nMEDIA:{document}"
-    provider = RecordingProvider()
-    config = OutboundFilesConfig.from_dict(
-        {
-            "provider": "test",
-            "file_expiry": "7d",
-            "image_expiry": None,
-        }
-    )
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
-    adapter._outbound_files = OutboundFileExporter(config, provider)
-
-    app = web.Application()
-    app.router.add_post("/v1/runs", adapter._handle_runs)
-    app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
-    app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
-
-    def create_agent(**kwargs):
-        agent = MagicMock()
-
-        def run_conversation(**_run_kwargs):
-            kwargs["stream_delta_callback"]("Ready\nMED")
-            kwargs["stream_delta_callback"](f"IA:{document}")
-            return {"final_response": raw}
-
-        agent.run_conversation.side_effect = run_conversation
-        agent.session_prompt_tokens = 1
-        agent.session_completion_tokens = 1
-        agent.session_total_tokens = 2
-        return agent
-
-    with patch.object(adapter, "_create_agent", side_effect=create_agent):
-        async with TestClient(TestServer(app)) as client:
-            response = await client.post("/v1/runs", json={"input": "make report"})
-            run_id = (await response.json())["run_id"]
-            for _ in range(40):
-                status = await (await client.get(f"/v1/runs/{run_id}")).json()
-                if status["status"] == "completed":
-                    break
-                await asyncio.sleep(0.05)
-            events = await client.get(f"/v1/runs/{run_id}/events")
-            wire_output = await events.text()
-
-    assert str(document) not in wire_output
-    assert str(document) not in status["output"]
-    assert "https://files.example.com/u/report.pdf" in wire_output
-    assert "https://files.example.com/u/report.pdf" in status["output"]
-    assert provider.uploads == [(document, "7d")]
 
 
 def test_managed_gateway_config_reaches_api_server_parser(tmp_path, monkeypatch):

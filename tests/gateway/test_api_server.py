@@ -183,8 +183,6 @@ class TestAdapterInit:
         assert adapter._port == 9999
         assert adapter._api_key == "sk-test"
         assert adapter._cors_origins == ("http://localhost:3000",)
-        assert adapter._outbound_files.provider.base_url == "https://files.example.com"
-        assert adapter._outbound_files.config.file_expiry == "14d"
 
 
     def test_create_agent_forwards_runtime_config(self, monkeypatch):
@@ -245,13 +243,14 @@ class TestAdapterInit:
         assert captured["checkpoint_max_total_size_mb"] == 321
         assert captured["checkpoint_max_file_size_mb"] == 4
         assert captured["compaction_callback"] is compaction_callback
-        assert agent._outbound_file_delivery_enabled is False
+        assert "outbound_files" not in captured["enabled_toolsets"]
 
-    def test_create_agent_enables_outbound_file_prompt_capability(self, monkeypatch):
+    def test_create_agent_enables_outbound_file_toolset(self, monkeypatch):
+        captured = {}
+
         class FakeAgent:
             def __init__(self, **kwargs):
-                self.model = kwargs.get("model")
-                self.provider = kwargs.get("provider")
+                captured.update(kwargs)
 
         monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
         monkeypatch.setattr(
@@ -273,6 +272,10 @@ class TestAdapterInit:
             staticmethod(lambda: None),
         )
         monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+        monkeypatch.setattr(
+            "tools.publish_file_tool.outbound_file_publishing_available",
+            lambda: True,
+        )
 
         adapter = APIServerAdapter(
             PlatformConfig(
@@ -288,9 +291,39 @@ class TestAdapterInit:
         )
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
 
-        agent = adapter._create_agent(session_id="api-session")
+        adapter._create_agent(session_id="api-session")
 
-        assert agent._outbound_file_delivery_enabled is True
+        assert "outbound_files" in captured["enabled_toolsets"]
+
+
+def test_responses_output_hides_publish_file_tool_only():
+    result = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "publish-call",
+                        "function": {"name": "publish_file", "arguments": "{}"},
+                    },
+                    {
+                        "id": "search-call",
+                        "function": {"name": "web_search", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "publish-call", "content": "private"},
+            {"role": "tool", "tool_call_id": "search-call", "content": "visible"},
+        ],
+        "final_response": "Here is the file link.",
+    }
+
+    output = APIServerAdapter._extract_output_items(result)
+
+    assert not any(item.get("name") == "publish_file" for item in output)
+    assert not any(item.get("call_id") == "publish-call" for item in output)
+    assert any(item.get("name") == "web_search" for item in output)
+    assert any(item.get("call_id") == "search-call" for item in output)
 
 
 # ---------------------------------------------------------------------------
@@ -1686,6 +1719,58 @@ class TestResponsesEndpoint:
 
 
 class TestResponsesStreaming:
+
+    @pytest.mark.asyncio
+    async def test_stream_hides_publish_file_tool_only(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                start = kwargs["tool_start_callback"]
+                complete = kwargs["tool_complete_callback"]
+                delta = kwargs["stream_delta_callback"]
+                start("call-publish", "publish_file", {"path": "report.pdf"})
+                complete(
+                    "call-publish",
+                    "publish_file",
+                    {"path": "report.pdf"},
+                    "private upload result",
+                )
+                start("call-search", "web_search", {"query": "example"})
+                complete(
+                    "call-search",
+                    "web_search",
+                    {"query": "example"},
+                    "visible search result",
+                )
+                delta("[Download report.pdf](https://files.example.com/u/report.pdf)")
+                await asyncio.sleep(0)
+                return (
+                    {
+                        "final_response": (
+                            "[Download report.pdf]"
+                            "(https://files.example.com/u/report.pdf)"
+                        ),
+                        "messages": [],
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "make report", "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        assert "publish_file" not in body
+        assert "call-publish" not in body
+        assert "private upload result" not in body
+        assert "web_search" in body
+        assert "call-search" in body
+        assert "visible search result" in body
+        assert "https://files.example.com/u/report.pdf" in body
 
     @pytest.mark.asyncio
     async def test_stream_emits_opt_in_openwebui_compaction_status(self, adapter):

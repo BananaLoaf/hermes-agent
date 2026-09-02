@@ -620,13 +620,6 @@ async def _handle_runs(
     self._run_approval_sessions[run_id] = approval_session_key
 
     event_cb = self._make_run_event_callback(run_id, loop)
-    media_buffer = (
-        _api_server.OutboundMediaStreamBuffer()
-        if self._outbound_files is not None
-        else None
-    )
-    media_exports: Dict[str, str] = {}
-    media_delta_queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
 
     def _put_event_if_active(event: Optional[Dict]) -> None:
         """Enqueue only while this run still owns live transport state."""
@@ -640,9 +633,6 @@ async def _handle_runs(
         if run_id not in self._run_streams:
             return
         try:
-            if media_buffer is not None:
-                loop.call_soon_threadsafe(media_delta_queue.put_nowait, delta)
-                return
             loop.call_soon_threadsafe(_put_event_if_active, {
                 "event": "message.delta",
                 "run_id": run_id,
@@ -651,26 +641,6 @@ async def _handle_runs(
             })
         except Exception:
             pass
-
-    async def _stream_media_deltas() -> None:
-        while True:
-            delta = await media_delta_queue.get()
-            if delta is None:
-                return
-            content = media_buffer.feed(delta)
-            if not content:
-                continue
-            if "MEDIA:" in content:
-                content = await self._export_outbound_media(
-                    content,
-                    exported_paths=media_exports,
-                )
-            _put_event_if_active({
-                "event": "message.delta",
-                "run_id": run_id,
-                "timestamp": time.time(),
-                "delta": content,
-            })
 
     initial_status = self._set_run_status(
         run_id,
@@ -732,11 +702,6 @@ async def _handle_runs(
     )
 
     async def _run_and_close():
-        media_delta_task = (
-            asyncio.create_task(_stream_media_deltas())
-            if media_buffer is not None
-            else None
-        )
         try:
             self._set_run_status(run_id, "running")
             if run_id in self._stopping_run_ids:
@@ -894,9 +859,6 @@ async def _handle_runs(
                     return r, u
 
             result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
-            if media_delta_task is not None:
-                await media_delta_queue.put(None)
-                await media_delta_task
             if (
                 run_id in self._stopping_run_ids
                 and isinstance(result, dict)
@@ -930,33 +892,7 @@ async def _handle_runs(
                     last_event="run.failed",
                 )
             else:
-                raw_final_response = (
-                    result.get("final_response", "")
-                    if isinstance(result, dict)
-                    else ""
-                )
-                if media_buffer is not None:
-                    media_tail = media_buffer.finish(raw_final_response)
-                    if media_tail:
-                        rendered_tail = await self._export_outbound_media(
-                            media_tail,
-                            exported_paths=media_exports,
-                        )
-                        if rendered_tail:
-                            _put_event_if_active({
-                                "event": "message.delta",
-                                "run_id": run_id,
-                                "timestamp": time.time(),
-                                "delta": rendered_tail,
-                            })
-                    final_response = await self._export_outbound_media(
-                        raw_final_response,
-                        exported_paths=media_exports,
-                    )
-                else:
-                    final_response = await self._export_outbound_media(
-                        raw_final_response
-                    )
+                final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 # Undelivered steer text (accepted after the final response;
                 # see turn_finalizer) rides on the terminal event/status so
                 # the client can replay it as the next user turn.
@@ -1037,8 +973,6 @@ async def _handle_runs(
             except Exception:
                 pass
         finally:
-            if media_delta_task is not None and not media_delta_task.done():
-                media_delta_task.cancel()
             # If the asyncio wrapper is cancelled (for example via
             # /stop), the executor thread can still be blocked waiting
             # on an approval Event. Unregistering here releases those

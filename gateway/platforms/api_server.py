@@ -153,7 +153,6 @@ from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
-from gateway.outbound_files import OutboundFileExporter, OutboundMediaStreamBuffer
 from gateway.browser_control_artifacts import (
     ArtifactError,
     ArtifactRateLimiter,
@@ -360,6 +359,7 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
 
 
 _REQUEST_OPTION_MISSING = object()
+_RESPONSES_HIDDEN_TOOL_NAMES = frozenset({"publish_file"})
 # Full internal ladder + "none": the API server accepts what /reasoning and
 # config.yaml accept (hermes_constants.VALID_REASONING_EFFORTS); wire-level
 # clamping to each provider's vocabulary happens downstream in the
@@ -1536,9 +1536,6 @@ class APIServerAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
-        self._outbound_files = OutboundFileExporter.from_dict(
-            extra.get("outbound_files")
-        )
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
         raw_port = extra.get("port")
         if raw_port is None:
@@ -1636,47 +1633,6 @@ class APIServerAdapter(BasePlatformAdapter):
         # _inject_browser_control_artifacts().
         self._browser_control_artifacts: Dict[str, ArtifactStore] = {}
         self._browser_control_artifact_limiter: Optional[ArtifactRateLimiter] = None
-
-    async def _export_outbound_media(
-        self,
-        text: str,
-        *,
-        exported_paths: Optional[Dict[str, str]] = None,
-    ) -> str:
-        if self._outbound_files is None:
-            return _resolve_media_to_data_urls(text)
-        return await self._outbound_files.export_media_text(
-            text,
-            exported_paths=exported_paths,
-        )
-
-    async def _export_transcript_media(
-        self,
-        messages: List[Dict[str, Any]],
-        *,
-        raw_final_response: Optional[str] = None,
-        exported_final_response: Optional[str] = None,
-        exported_paths: Optional[Dict[str, str]] = None,
-    ) -> List[Dict[str, Any]]:
-        """Return an egress-safe transcript without mutating agent state."""
-        exported: List[Dict[str, Any]] = []
-        for message in messages:
-            safe_message = dict(message)
-            content = safe_message.get("content")
-            if isinstance(content, str):
-                if (
-                    raw_final_response is not None
-                    and exported_final_response is not None
-                    and content == raw_final_response
-                ):
-                    safe_message["content"] = exported_final_response
-                else:
-                    safe_message["content"] = await self._export_outbound_media(
-                        content,
-                        exported_paths=exported_paths,
-                    )
-            exported.append(safe_message)
-        return exported
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -3203,6 +3159,17 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled_toolsets = list(policy.enabled_toolsets)
             max_iterations = policy.max_iterations
 
+        from tools.publish_file_tool import (
+            PUBLISH_FILE_TOOLSET,
+            outbound_file_publishing_available,
+        )
+
+        if (
+            outbound_file_publishing_available()
+            and PUBLISH_FILE_TOOLSET not in enabled_toolsets
+        ):
+            enabled_toolsets.append(PUBLISH_FILE_TOOLSET)
+
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = (
@@ -3259,10 +3226,6 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
-        # Prompt assembly is lazy, so expose the adapter capability before the
-        # first model call. This keeps MEDIA: guidance truthful for API server
-        # instances that have no outbound file provider configured.
-        agent._outbound_file_delivery_enabled = self._outbound_files is not None
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -4873,7 +4836,7 @@ class APIServerAdapter(BasePlatformAdapter):
         effective_session_id = (
             result.get("session_id") if isinstance(result, dict) else session_id
         )
-        final_response = await self._export_outbound_media(
+        final_response = _resolve_media_to_data_urls(
             result.get("final_response", "") if isinstance(result, dict) else ""
         )
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
@@ -4987,11 +4950,6 @@ class APIServerAdapter(BasePlatformAdapter):
             model=body.get("model", self._model_name),
         )
         seq = 0
-        media_buffer = (
-            OutboundMediaStreamBuffer() if self._outbound_files is not None else None
-        )
-        media_exports: Dict[str, str] = {}
-        media_delta_queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
             nonlocal seq
@@ -5017,36 +4975,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
         def _delta(delta: str) -> None:
-            if not delta:
-                return
-            if media_buffer is None:
-                _enqueue(
-                    "assistant.delta",
-                    {"message_id": message_id, "delta": delta},
-                )
-                return
-            try:
-                loop.call_soon_threadsafe(media_delta_queue.put_nowait, delta)
-            except RuntimeError:
-                pass
-
-        async def _stream_media_deltas() -> None:
-            while True:
-                delta = await media_delta_queue.get()
-                if delta is None:
-                    return
-                content = media_buffer.feed(delta)
-                if not content:
-                    continue
-                if "MEDIA:" in content:
-                    content = await self._export_outbound_media(
-                        content,
-                        exported_paths=media_exports,
-                    )
-                _enqueue(
-                    "assistant.delta",
-                    {"message_id": message_id, "delta": content},
-                )
+            if delta:
+                _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
@@ -5056,11 +4986,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
         async def _run_and_signal() -> None:
-            media_delta_task = (
-                asyncio.create_task(_stream_media_deltas())
-                if media_buffer is not None
-                else None
-            )
             try:
                 await queue.put(_event_payload("run.started", {
                     "user_message": {"role": "user", "content": user_message},
@@ -5085,48 +5010,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     confirmed_runtime_lock=lock_active,
                     **agent_overrides,
                 )
-                raw_final_response = (
+                final_response = _resolve_media_to_data_urls(
                     result.get("final_response", "") if isinstance(result, dict) else ""
                 )
-                if media_buffer is not None:
-                    await media_delta_queue.put(None)
-                    await media_delta_task
-                    media_tail = media_buffer.finish(raw_final_response)
-                    if media_tail:
-                        rendered_tail = await self._export_outbound_media(
-                            media_tail,
-                            exported_paths=media_exports,
-                        )
-                        _enqueue(
-                            "assistant.delta",
-                            {
-                                "message_id": message_id,
-                                "delta": rendered_tail,
-                            },
-                        )
-                    final_response = await self._export_outbound_media(
-                        raw_final_response,
-                        exported_paths=media_exports,
-                    )
-                else:
-                    final_response = await self._export_outbound_media(
-                        raw_final_response
-                    )
                 effective_session_id = (
                     result.get("session_id", session_id)
                     if isinstance(result, dict)
                     else session_id
                 )
-                turn_messages = (
-                    await self._export_transcript_media(
-                        self._turn_transcript_messages(history, user_message, result),
-                        raw_final_response=raw_final_response,
-                        exported_final_response=final_response,
-                        exported_paths=media_exports,
-                    )
-                    if isinstance(result, dict)
-                    else []
-                )
+                turn_messages = self._turn_transcript_messages(
+                    history, user_message, result
+                ) if isinstance(result, dict) else []
                 effective_runtime = {}
                 if isinstance(result, dict):
                     effective_runtime = result.get("runtime") or {}
@@ -5190,8 +5084,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
-                if media_delta_task is not None and not media_delta_task.done():
-                    media_delta_task.cancel()
                 self._active_run_agents.pop(run_id, None)
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
@@ -5595,9 +5487,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = await self._export_outbound_media(
-            result.get("final_response") or ""
-        )
+        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -5705,10 +5595,6 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
-        media_buffer = (
-            OutboundMediaStreamBuffer() if self._outbound_files is not None else None
-        )
-        media_exports: Dict[str, str] = {}
 
         try:
             last_activity = time.monotonic()
@@ -5721,24 +5607,6 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             await response.write(_sse_frame(role_chunk))
             last_activity = time.monotonic()
-
-            async def _write_content(content: str) -> None:
-                if not content:
-                    return
-                content_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": content},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                await response.write(_sse_frame(content_chunk))
 
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
@@ -5760,15 +5628,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         _sse_frame(item[1], event="hermes.tool.progress")
                     )
                 else:
-                    content = (
-                        media_buffer.feed(item) if media_buffer is not None else item
-                    )
-                    if content and "MEDIA:" in content:
-                        content = await self._export_outbound_media(
-                            content,
-                            exported_paths=media_exports,
-                        )
-                    await _write_content(content)
+                    content_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": item},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    await response.write(_sse_frame(content_chunk))
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent. Woken
@@ -5828,19 +5701,6 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
-
-            if media_buffer is not None:
-                authoritative_text = (
-                    result.get("final_response", "") if isinstance(result, dict) else ""
-                )
-                media_tail = media_buffer.finish(authoritative_text)
-                if media_tail:
-                    await _write_content(
-                        await self._export_outbound_media(
-                            media_tail,
-                            exported_paths=media_exports,
-                        )
-                    )
 
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.
@@ -5977,10 +5837,6 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
-        media_buffer = (
-            OutboundMediaStreamBuffer() if self._outbound_files is not None else None
-        )
-        media_exports: Dict[str, str] = {}
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
@@ -6297,16 +6153,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_compaction_status(payload)
                 elif isinstance(it, str):
                     # Batch text deltas — append to buffer, flush on timer
-                    content = media_buffer.feed(it) if media_buffer is not None else it
-                    if content:
-                        if "MEDIA:" in content:
-                            content = await self._export_outbound_media(
-                                content,
-                                exported_paths=media_exports,
-                            )
-                        _batch_buf.append(content)
-                        if _batch_timer is None:
-                            _batch_timer = asyncio.create_task(_batch_flush_after(0.05))
+                    _batch_buf.append(it)
+                    if _batch_timer is None:
+                        _batch_timer = asyncio.create_task(_batch_flush_after(0.05))
                 # Other types are silently dropped.
 
             # ── Batching state ──
@@ -6384,7 +6233,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_final = (
                     result.get("final_response", "") if isinstance(result, dict) else ""
                 )
-                if agent_final and not final_text_parts and media_buffer is None:
+                if agent_final and not final_text_parts:
                     await _emit_text_delta(agent_final)
                 if agent_final and not final_response_text:
                     final_response_text = agent_final
@@ -6399,16 +6248,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     "Error running agent for streaming responses: %s", e, exc_info=True
                 )
                 agent_error = _redact_api_error_text(e)
-
-            if media_buffer is not None:
-                media_tail = media_buffer.finish(agent_final)
-                if media_tail:
-                    await _emit_text_delta(
-                        await self._export_outbound_media(
-                            media_tail,
-                            exported_paths=media_exports,
-                        )
-                    )
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
@@ -6807,6 +6646,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
             def _on_tool_start(tool_call_id, function_name, function_args):
                 """Queue a started tool for live function_call streaming."""
+                if function_name in _RESPONSES_HIDDEN_TOOL_NAMES:
+                    return
                 _stream_q.put_threadsafe((
                     "__tool_started__",
                     {
@@ -6820,6 +6661,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_call_id, function_name, function_args, function_result
             ):
                 """Queue a completed tool result for live function_call_output streaming."""
+                if function_name in _RESPONSES_HIDDEN_TOOL_NAMES:
+                    return
                 _stream_q.put_threadsafe((
                     "__tool_completed__",
                     {
@@ -6959,9 +6802,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = await self._export_outbound_media(
-            result.get("final_response", "")
-        )
+        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
         if not final_response:
             final_response = _redact_api_error_text(
                 result.get("error", "(No response generated)")
@@ -7618,6 +7459,7 @@ class APIServerAdapter(BasePlatformAdapter):
         - a final ``message`` item with the assistant's text reply
         """
         items: List[Dict[str, Any]] = []
+        hidden_call_ids: set[str] = set()
         messages = result.get("messages", [])
         if start_index > 0:
             messages = messages[start_index:]
@@ -7627,6 +7469,9 @@ class APIServerAdapter(BasePlatformAdapter):
             if role == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     func = tc.get("function", {})
+                    if func.get("name", "") in _RESPONSES_HIDDEN_TOOL_NAMES:
+                        hidden_call_ids.add(tc.get("id", ""))
+                        continue
                     items.append({
                         "id": f"fc_{uuid.uuid4().hex[:24]}",
                         "type": "function_call",
@@ -7641,6 +7486,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         "call_id": tc.get("id", ""),
                     })
             elif role == "tool":
+                if msg.get("tool_call_id", "") in hidden_call_ids:
+                    continue
                 items.append({
                     "id": f"fco_{uuid.uuid4().hex[:24]}",
                     "type": "function_call_output",
