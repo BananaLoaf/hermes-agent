@@ -1552,6 +1552,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._direct_model_requests: bool = _coerce_request_bool(
             extra.get("direct_model_requests"), default=False
         )
+        # Open WebUI understands nested custom status events in a Responses
+        # stream. Keep the extension disabled for generic OpenAI clients.
+        self._openwebui_compact_event: bool = _coerce_request_bool(
+            extra.get("openwebui_compact_event"), default=False
+        )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -2923,6 +2928,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        compaction_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -3243,6 +3249,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
+            "compaction_callback": compaction_callback,
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
@@ -3458,6 +3465,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions_streaming": True,
                 "responses_api": True,
                 "responses_streaming": True,
+                "openwebui_compact_event": self._openwebui_compact_event,
                 "run_submission": True,
                 "runs_idempotency": _api_runs._idempotency_capabilities(
                     self,
@@ -5771,6 +5779,8 @@ class APIServerAdapter(BasePlatformAdapter):
           response object with all output items + usage (same payload
           shape as the non-streaming path for parity)
         - ``response.failed`` — terminal event on agent error
+        - optional ``hermes.context_compaction`` — transient Open WebUI
+          compaction status when ``openwebui_compact_event`` is enabled
 
         If the client disconnects mid-stream, ``agent.interrupt()`` is
         called so the agent stops issuing upstream LLM calls, then the
@@ -6047,15 +6057,32 @@ class APIServerAdapter(BasePlatformAdapter):
                     "item": output_item,
                 })
 
+            async def _emit_compaction_status(payload: Dict[str, Any]) -> None:
+                """Emit a transient status event using Open WebUI's contract."""
+                event_data = {
+                    "action": "context_compaction",
+                    "description": payload.get("message", ""),
+                    "done": bool(payload.get("done")),
+                }
+                if payload.get("error"):
+                    event_data["error"] = True
+                await _write_event("hermes.context_compaction", {
+                    "type": "hermes.context_compaction",
+                    "event": {
+                        "type": "context_compaction",
+                        "data": event_data,
+                    },
+                })
+
             # Main drain loop — thread-safe queue fed by agent callbacks.
             async def _dispatch(it) -> None:
                 """Route a queue item to the correct SSE emitter.
 
                 Plain strings are text deltas — they are batched (50ms)
                 to reduce Open WebUI re-render storms.  Tagged tuples
-                with ``__tool_started__`` / ``__tool_completed__``
-                prefixes are tool lifecycle events and flush the buffer
-                before emitting.
+                with ``__tool_started__`` / ``__tool_completed__`` /
+                ``__compaction_status__`` prefixes are lifecycle events and
+                flush the buffer before emitting.
                 """
                 nonlocal _batch_timer
                 if isinstance(it, tuple) and len(it) == 2 and isinstance(it[0], str):
@@ -6067,6 +6094,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_tool_started(payload)
                     elif tag == "__tool_completed__":
                         await _emit_tool_completed(payload)
+                    elif tag == "__compaction_status__":
+                        await _emit_compaction_status(payload)
                 elif isinstance(it, str):
                     # Batch text deltas — append to buffer, flush on timer
                     _batch_buf.append(it)
@@ -6490,6 +6519,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # agent runs so frontends can render text deltas and tool
             # calls in real time.  See _write_sse_responses for details.
             _stream_q = ThreadSafeAsyncQueue()
+            compaction_status_active = False
 
             def _on_delta(delta):
                 # None from the agent is a CLI box-close signal, not EOS.
@@ -6526,6 +6556,30 @@ class APIServerAdapter(BasePlatformAdapter):
                     "result": function_result,
                 }))
 
+            def _on_compaction(phase, payload):
+                """Bridge compaction lifecycle into Open WebUI status events."""
+                nonlocal compaction_status_active
+                data = payload if isinstance(payload, dict) else {}
+                message = str(data.get("message") or "").strip()
+                if phase in {"completed", "failed"}:
+                    if not compaction_status_active:
+                        return
+                    compaction_status_active = False
+                    _stream_q.put_threadsafe(("__compaction_status__", {
+                        "message": message,
+                        "done": True,
+                        "error": phase == "failed" or bool(data.get("error")),
+                    }))
+                    return
+
+                if phase == "started" and not compaction_status_active:
+                    compaction_status_active = True
+                    _stream_q.put_threadsafe(("__compaction_status__", {
+                        "message": message,
+                        "done": False,
+                        "error": False,
+                    }))
+
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -6533,6 +6587,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                compaction_callback=(
+                    _on_compaction
+                    if self._openwebui_compact_event
+                    else None
+                ),
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
@@ -7389,6 +7448,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        compaction_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -7465,6 +7525,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=stream_delta_callback,
+                        compaction_callback=compaction_callback,
                         tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback,
                         tool_complete_callback=tool_complete_callback,

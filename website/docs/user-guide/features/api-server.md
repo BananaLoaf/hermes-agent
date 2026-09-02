@@ -671,10 +671,11 @@ gateway:
     key: your-secret-key
     cors_origins: http://localhost:3000
     model_name: my-hermes
+    openwebui_compact_event: false
     max_concurrent_runs: 10   # concurrent-run cap; 0 disables the limit
 ```
 
-`port`, `key`, `host`, `cors_origins`, and `model_name` are automatically bridged into the platform's `extra` settings, so they behave exactly like their `API_SERVER_*` environment-variable counterparts. Environment variables take precedence over `config.yaml` values. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
+`port`, `key`, `host`, `cors_origins`, `model_name`, and `openwebui_compact_event` are automatically bridged into the platform's `extra` settings. Environment variables take precedence over `config.yaml` values where an environment-variable counterpart exists. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
 
 ### Concurrent-run cap
 
