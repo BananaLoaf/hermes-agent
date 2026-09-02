@@ -523,17 +523,41 @@ class TestPreflightCompression:
 
         assert compressed is messages
         assert prompt == "You are helpful."
-        assert [event for event, _ in events] == [
-            "lifecycle",
-            "warn",
-            "compaction_failed",
-        ]
-        assert events[-1] == ("compaction_failed", COMPACTION_FAILED_STATUS)
+        assert [event for event, _ in events] == ["lifecycle", "warn", "compacted"]
+        assert events[-1] == ("compacted", COMPACTION_DONE_STATUS)
         assert [phase for phase, _ in compaction_events] == ["started", "failed"]
-        assert compaction_events[-1][1]["error"] is True
+        assert compaction_events[-1][1] == {
+            "message": COMPACTION_FAILED_STATUS,
+            "error": True,
+        }
+
+    def test_compress_context_does_not_emit_completion_after_an_abort(self, agent):
+        """An aborted summary must not claim that compaction completed."""
+        agent.compression_enabled = False
+        events = []
+        compaction_events = []
+        agent.status_callback = lambda event, message: events.append((event, message))
+        agent.compaction_callback = lambda phase, payload: compaction_events.append(
+            (phase, payload)
+        )
+        messages = [{"role": "user", "content": "hello"}]
+
+        def _abort_compression(current_messages, **_kwargs):
+            agent.context_compressor._last_compress_aborted = True
+            agent.context_compressor._last_summary_error = "auxiliary model unavailable"
+            return current_messages
+
+        with patch.object(agent.context_compressor, "compress", side_effect=_abort_compression):
+            compressed, prompt = agent._compress_context(messages, "system prompt", force=True)
+
+        assert compressed is messages
+        assert prompt == "You are helpful."
+        assert [event for event, _ in events] == ["lifecycle", "warn"]
+        assert ("compacted", COMPACTION_DONE_STATUS) not in events
+        assert [phase for phase, _ in compaction_events] == ["started", "failed"]
 
     def test_compaction_callback_does_not_depend_on_status_text(self, agent):
-        """Structured clients receive phases even when an engine customizes text."""
+        """Structured clients receive phases when status text is customized."""
         agent.compression_enabled = False
         custom_status = "Custom context maintenance is running"
         agent.context_compressor.get_automatic_compaction_status_message = (
@@ -562,26 +586,6 @@ class TestPreflightCompression:
 
         assert [phase for phase, _ in compaction_events] == ["started", "completed"]
         assert compaction_events[0][1]["message"] == custom_status
-
-    def test_compress_context_does_not_emit_completion_after_an_abort(self, agent):
-        """An aborted summary must not claim that compaction completed."""
-        agent.compression_enabled = False
-        events = []
-        agent.status_callback = lambda event, message: events.append((event, message))
-        messages = [{"role": "user", "content": "hello"}]
-
-        def _abort_compression(current_messages, **_kwargs):
-            agent.context_compressor._last_compress_aborted = True
-            agent.context_compressor._last_summary_error = "auxiliary model unavailable"
-            return current_messages
-
-        with patch.object(agent.context_compressor, "compress", side_effect=_abort_compression):
-            compressed, prompt = agent._compress_context(messages, "system prompt", force=True)
-
-        assert compressed is messages
-        assert prompt == "You are helpful."
-        assert [event for event, _ in events] == ["lifecycle", "warn"]
-        assert ("compacted", COMPACTION_DONE_STATUS) not in events
 
     def test_compression_reuses_cached_prompt_when_memory_snapshot_is_unchanged(self, agent):
         """A byte-equal rebuild must keep the EXACT cached prompt object.

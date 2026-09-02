@@ -160,15 +160,11 @@ def _emit_compaction_done(agent: Any) -> None:
             status_callback("compacted", COMPACTION_DONE_STATUS)
         except Exception:
             logger.debug("status_callback error in compaction completion", exc_info=True)
-    _emit_compaction_event(
-        agent,
-        "completed",
-        COMPACTION_DONE_STATUS,
-    )
+    _emit_compaction_event(agent, "completed", COMPACTION_DONE_STATUS)
 
 
 def _emit_compaction_failed(agent: Any) -> None:
-    """Close the custom structured lifecycle without changing chat status UX."""
+    """Close the structured lifecycle without changing chat status UX."""
     _emit_compaction_event(
         agent,
         "failed",
@@ -3339,12 +3335,12 @@ def compress_context(
         else:
             _emit_compaction_failed(agent)
             if force_terminal:
+                # Preserve the existing status callback contract. The new
+                # structured callback carries the failure distinction.
                 status_callback = getattr(agent, "status_callback", None)
                 if status_callback:
                     try:
-                        status_callback(
-                            "compaction_failed", COMPACTION_FAILED_STATUS
-                        )
+                        status_callback("compacted", COMPACTION_DONE_STATUS)
                     except Exception:
                         logger.debug(
                             "status_callback error in compaction completion",

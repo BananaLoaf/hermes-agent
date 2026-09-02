@@ -541,7 +541,8 @@ class TestLoadGatewayConfig:
             "    outbound_files:\n"
             "      provider: zipline\n"
             "      base_url: https://files.example.com\n"
-            "      api_key: zipline-key\n",
+            "      api_key: zipline-key\n"
+            "    openwebui_compact_event: true\n",
             encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -558,6 +559,7 @@ class TestLoadGatewayConfig:
             "base_url": "https://files.example.com",
             "api_key": "zipline-key",
         }
+        assert extra["openwebui_compact_event"] is True
 
     def test_room_link_url_from_nested_gateway_section(self, tmp_path, monkeypatch):
         """The supported config path advertises no endpoint until restart."""

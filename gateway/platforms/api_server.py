@@ -1576,6 +1576,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._direct_model_requests: bool = _coerce_request_bool(
             extra.get("direct_model_requests"), default=False
         )
+        # Open WebUI understands nested custom status events in a Responses
+        # stream. Keep the extension disabled for generic OpenAI clients.
+        self._openwebui_compact_event: bool = _coerce_request_bool(
+            extra.get("openwebui_compact_event"), default=False
+        )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -3396,7 +3401,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions_streaming": True,
                 "responses_api": True,
                 "responses_streaming": True,
-                "compaction_status_events": True,
+                "openwebui_compact_event": self._openwebui_compact_event,
                 "run_submission": True,
                 "runs_idempotency": _api_runs._idempotency_capabilities(
                     self,
@@ -5802,8 +5807,8 @@ class APIServerAdapter(BasePlatformAdapter):
           response object with all output items + usage (same payload
           shape as the non-streaming path for parity)
         - ``response.failed`` — terminal event on agent error
-        - opt-in ``hermes.context_compaction`` — transient compression
-          lifecycle for clients that send ``X-Hermes-Events: compaction``
+        - optional ``hermes.context_compaction`` — transient Open WebUI
+          compaction status when ``openwebui_compact_event`` is enabled
 
         If the client disconnects mid-stream, ``agent.interrupt()`` is
         called so the agent stops issuing upstream LLM calls, then the
@@ -6099,13 +6104,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
 
             async def _emit_compaction_status(payload: Dict[str, Any]) -> None:
-                """Emit an opt-in transient status understood by Open WebUI.
-
-                The nested event uses Open WebUI's existing status-event
-                contract. It is deliberately absent from Responses output and
-                persistence, so strict clients and model-visible history stay
-                OpenAI-compatible.
-                """
+                """Emit a transient status event using Open WebUI's contract."""
                 event_data = {
                     "action": "context_compaction",
                     "description": payload.get("message", ""),
@@ -6605,12 +6604,6 @@ class APIServerAdapter(BasePlatformAdapter):
             # agent runs so frontends can render text deltas and tool
             # calls in real time.  See _write_sse_responses for details.
             _stream_q = ThreadSafeAsyncQueue()
-            requested_hermes_events = {
-                event.strip().lower()
-                for event in request.headers.get("X-Hermes-Events", "").split(",")
-                if event.strip()
-            }
-            emit_compaction_status = "compaction" in requested_hermes_events
             compaction_status_active = False
 
             def _on_delta(delta):
@@ -6661,59 +6654,49 @@ class APIServerAdapter(BasePlatformAdapter):
                 ))
 
             def _on_compaction(phase, payload):
-                """Bridge semantic compaction lifecycle into an opt-in SSE event."""
+                """Bridge compaction lifecycle into Open WebUI status events."""
                 nonlocal compaction_status_active
-                if not emit_compaction_status:
-                    return
-
                 data = payload if isinstance(payload, dict) else {}
-                text = str(data.get("message") or "").strip()
+                message = str(data.get("message") or "").strip()
                 if phase in {"completed", "failed"}:
                     if not compaction_status_active:
                         return
                     compaction_status_active = False
-                    _stream_q.put_threadsafe((
-                        "__compaction_status__",
-                        {
-                            "message": text,
-                            "done": True,
-                            "error": phase == "failed" or bool(data.get("error")),
-                        },
-                    ))
+                    _stream_q.put_threadsafe(("__compaction_status__", {
+                        "message": message,
+                        "done": True,
+                        "error": phase == "failed" or bool(data.get("error")),
+                    }))
                     return
 
-                if phase != "started":
-                    return
-                if compaction_status_active:
-                    return
-                compaction_status_active = True
-                _stream_q.put_threadsafe((
-                    "__compaction_status__",
-                    {
-                        "message": text,
+                if phase == "started" and not compaction_status_active:
+                    compaction_status_active = True
+                    _stream_q.put_threadsafe(("__compaction_status__", {
+                        "message": message,
                         "done": False,
                         "error": False,
-                    },
-                ))
+                    }))
 
             agent_ref = [None]
-            agent_task = asyncio.ensure_future(
-                self._run_agent(
-                    user_message=user_message,
-                    conversation_history=conversation_history,
-                    ephemeral_system_prompt=instructions,
-                    session_id=session_id,
-                    stream_delta_callback=_on_delta,
-                    compaction_callback=_on_compaction,
-                    tool_progress_callback=_on_tool_progress,
-                    tool_start_callback=_on_tool_start,
-                    tool_complete_callback=_on_tool_complete,
-                    agent_ref=agent_ref,
-                    gateway_session_key=gateway_session_key,
-                    **agent_overrides,
-                    route=route,
-                )
-            )
+            agent_task = asyncio.ensure_future(self._run_agent(
+                user_message=user_message,
+                conversation_history=conversation_history,
+                ephemeral_system_prompt=instructions,
+                session_id=session_id,
+                stream_delta_callback=_on_delta,
+                compaction_callback=(
+                    _on_compaction
+                    if self._openwebui_compact_event
+                    else None
+                ),
+                tool_progress_callback=_on_tool_progress,
+                tool_start_callback=_on_tool_start,
+                tool_complete_callback=_on_tool_complete,
+                agent_ref=agent_ref,
+                gateway_session_key=gateway_session_key,
+                **agent_overrides,
+                route=route,
+            ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put_nowait(None))
