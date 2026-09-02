@@ -629,12 +629,7 @@ async def _handle_runs(
     self._run_approval_sessions[run_id] = approval_session_key
 
     event_cb = self._make_run_event_callback(run_id, loop)
-    media_buffer = (
-        _api_server.OutboundMediaStreamBuffer()
-        if self._outbound_files is not None
-        else None
-    )
-    media_exports: Dict[str, str] = {}
+    outbound = self._new_outbound_response_processor()
     media_delta_queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
 
     def _put_event_if_active(event: Optional[Dict]) -> None:
@@ -649,7 +644,7 @@ async def _handle_runs(
         if run_id not in self._run_streams:
             return
         try:
-            if media_buffer is not None:
+            if outbound.buffers_stream:
                 loop.call_soon_threadsafe(media_delta_queue.put_nowait, delta)
                 return
             loop.call_soon_threadsafe(_put_event_if_active, {
@@ -666,14 +661,9 @@ async def _handle_runs(
             delta = await media_delta_queue.get()
             if delta is None:
                 return
-            content = media_buffer.feed(delta)
+            content = await outbound.feed(delta)
             if not content:
                 continue
-            if "MEDIA:" in content:
-                content = await self._export_outbound_media(
-                    content,
-                    exported_paths=media_exports,
-                )
             _put_event_if_active({
                 "event": "message.delta",
                 "run_id": run_id,
@@ -743,7 +733,7 @@ async def _handle_runs(
     async def _run_and_close():
         media_delta_task = (
             asyncio.create_task(_stream_media_deltas())
-            if media_buffer is not None
+            if outbound.buffers_stream
             else None
         )
         try:
@@ -951,28 +941,15 @@ async def _handle_runs(
                     if isinstance(result, dict)
                     else ""
                 )
-                if media_buffer is not None:
-                    media_tail = media_buffer.finish(raw_final_response)
-                    if media_tail:
-                        rendered_tail = await self._export_outbound_media(
-                            media_tail,
-                            exported_paths=media_exports,
-                        )
-                        if rendered_tail:
-                            _put_event_if_active({
-                                "event": "message.delta",
-                                "run_id": run_id,
-                                "timestamp": time.time(),
-                                "delta": rendered_tail,
-                            })
-                    final_response = await self._export_outbound_media(
-                        raw_final_response,
-                        exported_paths=media_exports,
-                    )
-                else:
-                    final_response = await self._export_outbound_media(
-                        raw_final_response
-                    )
+                rendered_tail = await outbound.finish(raw_final_response)
+                if rendered_tail:
+                    _put_event_if_active({
+                        "event": "message.delta",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "delta": rendered_tail,
+                    })
+                final_response = await outbound.render(raw_final_response)
                 # Undelivered steer text (accepted after the final response;
                 # see turn_finalizer) rides on the terminal event/status so
                 # the client can replay it as the next user turn.

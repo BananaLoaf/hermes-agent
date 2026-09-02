@@ -19,11 +19,7 @@ try:
 except ImportError:  # Keep gateway imports usable without the messaging extra.
     aiohttp = None
 
-from gateway.platforms.base import (
-    MEDIA_TAG_CLEANUP_RE,
-    BasePlatformAdapter,
-    validate_media_delivery_path,
-)
+from gateway.platforms.base import validate_media_delivery_path
 from hermes_time import now as hermes_now
 
 logger = logging.getLogger(__name__)
@@ -58,11 +54,6 @@ _INLINE_IMAGE_MIME_BY_EXTENSION = {
     ".svg": "image/svg+xml",
     ".bmp": "image/bmp",
 }
-_FALLBACK_MEDIA_RE = re.compile(
-    r"""MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|"""
-    r"""(?:~/|/|[A-Za-z]:[/\\])[^\n]*?)(?=\n|MEDIA:|$)""",
-    re.IGNORECASE,
-)
 _DEFAULT_IMAGE_TEMPLATE = "![{filename}]({url})"
 _DEFAULT_FILE_TEMPLATE = "[Download {filename}]({url})"
 _DEFAULT_INVALID_IMAGE_TEMPLATE = "[Image unavailable]"
@@ -437,13 +428,6 @@ def _markdown_label(value: str) -> str:
     return cleaned.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
 
-def _normalize_media_path(value: str) -> str:
-    path = str(value or "").strip()
-    if len(path) >= 2 and path[0] == path[-1] and path[0] in {'"', "'", "`"}:
-        path = path[1:-1].strip()
-    return path
-
-
 class OutboundFileExporter:
     """Validate MEDIA paths, publish them, and render provider-neutral Markdown."""
 
@@ -481,141 +465,17 @@ class OutboundFileExporter:
         )
         return template.format()
 
-    async def export_media_text(
-        self,
-        text: str,
-        *,
-        exported_paths: Optional[dict[str, str]] = None,
-    ) -> str:
-        if not text or "MEDIA:" not in text:
-            return text
-
-        scan_text = BasePlatformAdapter._mask_protected_spans(text)
-        scan_text = BasePlatformAdapter._mask_json_string_media(scan_text)
-        matches = [
-            (match.start(), match.end(), match.group("path"))
-            for match in MEDIA_TAG_CLEANUP_RE.finditer(scan_text)
-        ]
-        occupied = [(start, end) for start, end, _path in matches]
-        for match in _FALLBACK_MEDIA_RE.finditer(scan_text):
-            if any(
-                match.start() < end and match.end() > start for start, end in occupied
-            ):
-                continue
-            matches.append((match.start(), match.end(), match.group("path")))
-        if not matches:
-            return text
-        matches.sort(key=lambda item: item[0])
-
-        rendered: list[str] = []
-        cursor = 0
-        path_cache = exported_paths if exported_paths is not None else {}
-        for start, end, raw_path in matches:
-            rendered.append(text[cursor:start])
-            normalized_path = _normalize_media_path(raw_path)
-            safe_path = validate_media_delivery_path(normalized_path)
-            if not safe_path:
-                rendered.append(self.invalid_output(Path(normalized_path)))
-            else:
-                replacement = path_cache.get(safe_path)
-                if replacement is None:
-                    try:
-                        replacement = await self.export_file(Path(safe_path))
-                    except Exception as exc:
-                        logger.warning(
-                            "Outbound file upload through %s failed: %s",
-                            self.config.provider,
-                            type(exc).__name__,
-                        )
-                        replacement = self.invalid_output(Path(safe_path))
-                    path_cache[safe_path] = replacement
-                rendered.append(replacement)
-            cursor = end
-        rendered.append(text[cursor:])
-        return "".join(rendered)
-
-
-class OutboundMediaStreamBuffer:
-    """Release text once any MEDIA path in it has an explicit boundary."""
-
-    _MARKER = "MEDIA:"
-
-    def __init__(self):
-        self._pending = ""
-        self._emitted = ""
-        self._capturing_media = False
-
-    def feed(self, chunk: str) -> str:
-        if not chunk:
-            return ""
-        self._pending += chunk
-        ready: list[str] = []
-
-        while self._pending:
-            if self._capturing_media:
-                media_end = self._complete_media_end()
-                if media_end is None:
-                    break
-                ready.append(self._pending[:media_end])
-                self._pending = self._pending[media_end:]
-                self._capturing_media = False
-                continue
-
-            marker_index = self._pending.find(self._MARKER)
-            if marker_index >= 0:
-                ready.append(self._pending[:marker_index])
-                self._pending = self._pending[marker_index:]
-                self._capturing_media = True
-                continue
-
-            keep = 0
-            max_keep = min(len(self._pending), len(self._MARKER) - 1)
-            for size in range(max_keep, 0, -1):
-                if self._MARKER.startswith(self._pending[-size:]):
-                    keep = size
-                    break
-            ready.append(self._pending[:-keep] if keep else self._pending)
-            self._pending = self._pending[-keep:] if keep else ""
-            break
-
-        output = "".join(ready)
-        self._emitted += output
-        return output
-
-    def _complete_media_end(self) -> Optional[int]:
-        """Return the raw directive end only when its boundary is explicit."""
-        prefix = re.match(r"MEDIA:\s*", self._pending)
-        if prefix is None:
-            return None
-        path_start = prefix.end()
-        if path_start >= len(self._pending):
-            return None
-
-        quote = self._pending[path_start]
-        if quote in {'"', "'", "`"}:
-            closing_quote = self._pending.find(quote, path_start + 1)
-            return closing_quote + 1 if closing_quote >= 0 else None
-
-        # A NUL sentinel prevents the regex's end-of-string branch from
-        # treating the latest partial chunk as a complete path. Real
-        # whitespace, punctuation, or a following MEDIA: still terminates it.
-        known_extension = MEDIA_TAG_CLEANUP_RE.match(f"{self._pending}\0")
-        if known_extension is not None:
-            return known_extension.end()
-
-        newline = self._pending.find("\n", path_start)
-        if newline >= 0:
-            return newline
-
-        next_marker = self._pending.find(self._MARKER, path_start)
-        if next_marker >= 0:
-            return next_marker
-        return None
-
-    def finish(self, authoritative_text: Optional[str] = None) -> str:
-        if authoritative_text and authoritative_text.startswith(self._emitted):
-            tail = authoritative_text[len(self._emitted) :]
-        else:
-            tail = self._pending
-        self._pending = ""
-        return tail
+    async def export_media_path(self, path: str) -> str:
+        """Publish one intercepted media path and return its replacement text."""
+        safe_path = validate_media_delivery_path(path)
+        if not safe_path:
+            return self.invalid_output(Path(path))
+        try:
+            return await self.export_file(Path(safe_path))
+        except Exception as exc:
+            logger.warning(
+                "Outbound file upload through %s failed: %s",
+                self.config.provider,
+                type(exc).__name__,
+            )
+            return self.invalid_output(Path(safe_path))

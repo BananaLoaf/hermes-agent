@@ -5,12 +5,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from gateway.media_response_processor import MediaResponseProcessor
 from gateway.outbound_files import (
     OutboundFileExporter,
     OutboundFileProvider,
     OutboundFilesConfig,
     OutboundFilesConfigError,
-    OutboundMediaStreamBuffer,
     UploadedFile,
     ZiplineOutboundFileProvider,
     _content_type_for_path,
@@ -254,7 +254,7 @@ async def test_exporter_selects_expiry_and_markdown_by_file_kind(tmp_path, monke
     )
     exporter = OutboundFileExporter(config, provider)
 
-    rendered = await exporter.export_media_text(
+    rendered = await MediaResponseProcessor(exporter.export_media_path).render(
         f"Chart:\nMEDIA:{image}\nDiagram:\nMEDIA:{svg}\nReport:\nMEDIA:{document}"
     )
 
@@ -356,7 +356,7 @@ async def test_exporter_handles_quoted_unknown_extension_and_hides_invalid_path(
     )
     exporter = OutboundFileExporter(config, provider)
 
-    rendered = await exporter.export_media_text(
+    rendered = await MediaResponseProcessor(exporter.export_media_path).render(
         f'MEDIA:"{artifact}"\nMEDIA:"{missing_file}"\nMEDIA:"{missing_image}"'
     )
 
@@ -367,24 +367,6 @@ async def test_exporter_handles_quoted_unknown_extension_and_hides_invalid_path(
     assert "IMAGE UNAVAILABLE" in rendered
     assert "FILE UNAVAILABLE" in rendered
     assert provider.uploads == [(artifact, "7d")]
-
-
-def test_stream_buffer_never_emits_a_split_media_marker():
-    buffer = OutboundMediaStreamBuffer()
-
-    assert buffer.feed("Ready\nMED") == "Ready\n"
-    assert buffer.feed("IA:/tmp/partial-") == ""
-    assert buffer.feed("report") == ""
-    assert buffer.feed(".pdf\nDone") == "MEDIA:/tmp/partial-report.pdf\nDone"
-    assert buffer.finish("Ready\nMEDIA:/tmp/partial-report.pdf\nDone") == ""
-
-
-def test_stream_buffer_releases_quoted_path_at_closing_quote():
-    buffer = OutboundMediaStreamBuffer()
-
-    assert buffer.feed('MEDIA:"/tmp/partial') == ""
-    assert buffer.feed(' report.custom"') == 'MEDIA:"/tmp/partial report.custom"'
-    assert buffer.finish('MEDIA:"/tmp/partial report.custom"') == ""
 
 
 @pytest.mark.asyncio
@@ -501,10 +483,12 @@ async def test_session_transcript_reuses_exported_final_without_uploading_twice(
     )
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     adapter._outbound_files = OutboundFileExporter(config, provider)
-    exported_final = await adapter._export_outbound_media(raw)
+    processor = adapter._new_outbound_response_processor()
+    exported_final = await processor.render(raw)
 
     original = [{"role": "assistant", "content": raw}]
-    exported = await adapter._export_transcript_media(
+    exported = await adapter._render_outbound_transcript(
+        processor,
         original,
         raw_final_response=raw,
         exported_final_response=exported_final,

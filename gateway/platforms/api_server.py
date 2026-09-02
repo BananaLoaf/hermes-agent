@@ -142,18 +142,17 @@ from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.base import (
-    MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
     SendResult,
     is_network_accessible,
-    validate_media_delivery_path,
 )
 # Re-exported here for existing imports and constructor monkeypatches.
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
-from gateway.outbound_files import OutboundFileExporter, OutboundMediaStreamBuffer
+from gateway.media_response_processor import MediaResponseProcessor
+from gateway.outbound_files import OutboundFileExporter
 from gateway.browser_control_artifacts import (
     ArtifactError,
     ArtifactRateLimiter,
@@ -1159,82 +1158,6 @@ else:
     cors_middleware = None  # type: ignore[assignment]
 
 
-_MEDIA_IMG_EXT = {
-    ".png",
-    ".apng",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".webp",
-    ".avif",
-    ".svg",
-    ".bmp",
-}
-_MEDIA_MIME = {
-    ".png": "image/png",
-    ".apng": "image/apng",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-    ".avif": "image/avif",
-    ".bmp": "image/bmp",
-    ".svg": "image/svg+xml",
-}
-_MEDIA_DATA_URL_MAX_BYTES = 5 * 1024 * 1024  # skip images larger than 5MB
-
-
-def _resolve_media_to_data_urls(text: str) -> str:
-    """Replace ``MEDIA:<path>`` image tags with inline base64 data URLs.
-
-    Remote OpenAI-compatible frontends can't read local file paths, so
-    ``MEDIA:`` tags referencing images on the server are useless to them.
-    Inline small local images as markdown data URLs; non-image or unreadable
-    paths are left untouched.
-
-    Uses the same anchored ``MEDIA_TAG_CLEANUP_RE`` matcher and
-    ``validate_media_delivery_path`` safety check every other platform
-    adapter's media delivery already goes through (gateway/platforms/base.py)
-    — an absolute-path anchor plus a known-extension requirement, and a
-    resolved-path check against the credential/system-path denylist. The
-    prior pattern here matched any bare token after ``MEDIA:`` (including a
-    relative/traversal path like ``../../etc/passwd.png``) and read the file
-    directly with no denylist, so any image-suffixed, readable file the
-    process could see was base64-exfiltrated to the API caller if its path
-    merely appeared in the model's own final reply text.
-    """
-    if not text or "MEDIA:" not in text:
-        return text
-    import base64
-
-    def _to_data_url(path_str: str) -> Optional[str]:
-        # validate_media_delivery_path() strips wrapping quotes/backticks
-        # and trailing punctuation internally, same as MEDIA_TAG_CLEANUP_RE's
-        # other callers (extract_media / _strip_media_tag_directives) rely on.
-        safe_path = validate_media_delivery_path(path_str)
-        if not safe_path:
-            return None
-        p = Path(safe_path)
-        suffix = p.suffix.lower()
-        if suffix not in _MEDIA_IMG_EXT:
-            return None
-        try:
-            if p.stat().st_size > _MEDIA_DATA_URL_MAX_BYTES:
-                return None
-            b64 = base64.b64encode(p.read_bytes()).decode()
-        except OSError:
-            return None
-        return f"![image](data:{_MEDIA_MIME[suffix]};base64,{b64})"
-
-    def _repl(m: "re.Match[str]") -> str:
-        return _to_data_url(m.group("path")) or m.group(0)
-
-    try:
-        return MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
-    except Exception:
-        return text
-
-
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     """Redact API-bound error text before it crosses the HTTP boundary."""
     redacted = redact_sensitive_text(str(value), force=True)
@@ -1642,26 +1565,28 @@ class APIServerAdapter(BasePlatformAdapter):
         self._browser_control_artifacts: Dict[str, ArtifactStore] = {}
         self._browser_control_artifact_limiter: Optional[ArtifactRateLimiter] = None
 
-    async def _export_outbound_media(
-        self,
-        text: str,
-        *,
-        exported_paths: Optional[Dict[str, str]] = None,
-    ) -> str:
-        if self._outbound_files is None:
-            return _resolve_media_to_data_urls(text)
-        return await self._outbound_files.export_media_text(
-            text,
-            exported_paths=exported_paths,
-        )
+    def _new_outbound_response_processor(self) -> MediaResponseProcessor:
+        """Bind generic MEDIA interception to this deployment's renderer."""
+        exporter = self._outbound_files
 
-    async def _export_transcript_media(
-        self,
+        async def replace_media(path: str) -> Optional[str]:
+            if exporter is None:
+                return "[File omitted]"
+            return await exporter.export_media_path(path)
+
+        return MediaResponseProcessor(replace_media)
+
+    async def _render_outbound_text(self, text: str) -> str:
+        """Render a complete one-shot response through the egress processor."""
+        return await self._new_outbound_response_processor().render(text)
+
+    @staticmethod
+    async def _render_outbound_transcript(
+        processor: MediaResponseProcessor,
         messages: List[Dict[str, Any]],
         *,
         raw_final_response: Optional[str] = None,
         exported_final_response: Optional[str] = None,
-        exported_paths: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         """Return an egress-safe transcript without mutating agent state."""
         exported: List[Dict[str, Any]] = []
@@ -1676,10 +1601,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ):
                     safe_message["content"] = exported_final_response
                 else:
-                    safe_message["content"] = await self._export_outbound_media(
-                        content,
-                        exported_paths=exported_paths,
-                    )
+                    safe_message["content"] = await processor.render(content)
             exported.append(safe_message)
         return exported
 
@@ -4931,7 +4853,7 @@ class APIServerAdapter(BasePlatformAdapter):
         effective_session_id = (
             result.get("session_id") if isinstance(result, dict) else session_id
         )
-        final_response = await self._export_outbound_media(
+        final_response = await self._render_outbound_text(
             result.get("final_response", "") if isinstance(result, dict) else ""
         )
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
@@ -5045,10 +4967,7 @@ class APIServerAdapter(BasePlatformAdapter):
             model=body.get("model", self._model_name),
         )
         seq = 0
-        media_buffer = (
-            OutboundMediaStreamBuffer() if self._outbound_files is not None else None
-        )
-        media_exports: Dict[str, str] = {}
+        outbound = self._new_outbound_response_processor()
         media_delta_queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
@@ -5077,7 +4996,7 @@ class APIServerAdapter(BasePlatformAdapter):
         def _delta(delta: str) -> None:
             if not delta:
                 return
-            if media_buffer is None:
+            if not outbound.buffers_stream:
                 _enqueue(
                     "assistant.delta",
                     {"message_id": message_id, "delta": delta},
@@ -5093,14 +5012,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 delta = await media_delta_queue.get()
                 if delta is None:
                     return
-                content = media_buffer.feed(delta)
+                content = await outbound.feed(delta)
                 if not content:
                     continue
-                if "MEDIA:" in content:
-                    content = await self._export_outbound_media(
-                        content,
-                        exported_paths=media_exports,
-                    )
                 _enqueue(
                     "assistant.delta",
                     {"message_id": message_id, "delta": content},
@@ -5116,7 +5030,7 @@ class APIServerAdapter(BasePlatformAdapter):
         async def _run_and_signal() -> None:
             media_delta_task = (
                 asyncio.create_task(_stream_media_deltas())
-                if media_buffer is not None
+                if outbound.buffers_stream
                 else None
             )
             try:
@@ -5146,15 +5060,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 raw_final_response = (
                     result.get("final_response", "") if isinstance(result, dict) else ""
                 )
-                if media_buffer is not None:
+                if outbound.buffers_stream:
                     await media_delta_queue.put(None)
                     await media_delta_task
-                    media_tail = media_buffer.finish(raw_final_response)
-                    if media_tail:
-                        rendered_tail = await self._export_outbound_media(
-                            media_tail,
-                            exported_paths=media_exports,
-                        )
+                    rendered_tail = await outbound.finish(raw_final_response)
+                    if rendered_tail:
                         _enqueue(
                             "assistant.delta",
                             {
@@ -5162,25 +5072,18 @@ class APIServerAdapter(BasePlatformAdapter):
                                 "delta": rendered_tail,
                             },
                         )
-                    final_response = await self._export_outbound_media(
-                        raw_final_response,
-                        exported_paths=media_exports,
-                    )
-                else:
-                    final_response = await self._export_outbound_media(
-                        raw_final_response
-                    )
+                final_response = await outbound.render(raw_final_response)
                 effective_session_id = (
                     result.get("session_id", session_id)
                     if isinstance(result, dict)
                     else session_id
                 )
                 turn_messages = (
-                    await self._export_transcript_media(
+                    await self._render_outbound_transcript(
+                        outbound,
                         self._turn_transcript_messages(history, user_message, result),
                         raw_final_response=raw_final_response,
                         exported_final_response=final_response,
-                        exported_paths=media_exports,
                     )
                     if isinstance(result, dict)
                     else []
@@ -5680,7 +5583,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = await self._export_outbound_media(
+        final_response = await self._render_outbound_text(
             result.get("final_response") or ""
         )
         is_partial = bool(result.get("partial"))
@@ -5790,10 +5693,7 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
-        media_buffer = (
-            OutboundMediaStreamBuffer() if self._outbound_files is not None else None
-        )
-        media_exports: Dict[str, str] = {}
+        outbound = self._new_outbound_response_processor()
 
         try:
             last_activity = time.monotonic()
@@ -5845,14 +5745,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         _sse_frame(item[1], event="hermes.tool.progress")
                     )
                 else:
-                    content = (
-                        media_buffer.feed(item) if media_buffer is not None else item
-                    )
-                    if content and "MEDIA:" in content:
-                        content = await self._export_outbound_media(
-                            content,
-                            exported_paths=media_exports,
-                        )
+                    content = await outbound.feed(item)
                     await _write_content(content)
                 return time.monotonic()
 
@@ -5914,18 +5807,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
 
-            if media_buffer is not None:
-                authoritative_text = (
-                    result.get("final_response", "") if isinstance(result, dict) else ""
-                )
-                media_tail = media_buffer.finish(authoritative_text)
-                if media_tail:
-                    await _write_content(
-                        await self._export_outbound_media(
-                            media_tail,
-                            exported_paths=media_exports,
-                        )
-                    )
+            authoritative_text = (
+                result.get("final_response", "") if isinstance(result, dict) else ""
+            )
+            media_tail = await outbound.finish(authoritative_text)
+            if media_tail:
+                await _write_content(media_tail)
 
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.
@@ -6062,10 +5949,7 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
-        media_buffer = (
-            OutboundMediaStreamBuffer() if self._outbound_files is not None else None
-        )
-        media_exports: Dict[str, str] = {}
+        outbound = self._new_outbound_response_processor()
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
@@ -6376,13 +6260,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_compaction_status(payload)
                 elif isinstance(it, str):
                     # Batch text deltas — append to buffer, flush on timer
-                    content = media_buffer.feed(it) if media_buffer is not None else it
+                    content = await outbound.feed(it)
                     if content:
-                        if "MEDIA:" in content:
-                            content = await self._export_outbound_media(
-                                content,
-                                exported_paths=media_exports,
-                            )
                         _batch_buf.append(content)
                         if _batch_timer is None:
                             _batch_timer = asyncio.create_task(_batch_flush_after(0.05))
@@ -6463,7 +6342,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_final = (
                     result.get("final_response", "") if isinstance(result, dict) else ""
                 )
-                if agent_final and not final_text_parts and media_buffer is None:
+                if agent_final and not final_text_parts and not outbound.buffers_stream:
                     await _emit_text_delta(agent_final)
                 if agent_final and not final_response_text:
                     final_response_text = agent_final
@@ -6479,15 +6358,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 agent_error = _redact_api_error_text(e)
 
-            if media_buffer is not None:
-                media_tail = media_buffer.finish(agent_final)
-                if media_tail:
-                    await _emit_text_delta(
-                        await self._export_outbound_media(
-                            media_tail,
-                            exported_paths=media_exports,
-                        )
-                    )
+            media_tail = await outbound.finish(agent_final)
+            if media_tail:
+                await _emit_text_delta(media_tail)
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
@@ -7027,7 +6900,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = await self._export_outbound_media(
+        final_response = await self._render_outbound_text(
             result.get("final_response", "")
         )
         if not final_response:
