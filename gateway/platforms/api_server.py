@@ -1128,7 +1128,10 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": (
+        "Authorization, Content-Type, Idempotency-Key, "
+        "X-Hermes-Session-Id, X-Hermes-Session-Key"
+    ),
 }
 
 
@@ -5850,6 +5853,7 @@ class APIServerAdapter(BasePlatformAdapter):
         store: bool,
         session_id: str,
         gateway_session_key: Optional[str] = None,
+        client_session_id: Optional[str] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -5964,6 +5968,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "conversation_history": conversation_history_snapshot,
                     "instructions": instructions,
                     "session_id": session_id_snapshot or session_id,
+                    "client_session_id": client_session_id,
                 },
             )
             if conversation:
@@ -6624,21 +6629,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
 
         stored_session_id = None
-        if not conversation_history and previous_response_id:
+        stored_client_session_id = None
+        if previous_response_id:
             stored = self._response_store.get(previous_response_id)
-            if stored is None:
+            if stored is None and not conversation_history:
                 return web.json_response(
                     _openai_error(
                         f"Previous response not found: {previous_response_id}"
                     ),
                     status=404,
                 )
-            conversation_history = list(stored.get("conversation_history", []))
-            stored_session_id = stored.get("session_id")
-            # Preserve Responses API metadata continuity. _create_agent()
-            # ignores these client instructions under the managed-only policy.
-            if instructions is None:
-                instructions = stored.get("instructions")
+            if stored is not None:
+                stored_session_id = stored.get("session_id")
+                stored_client_session_id = stored.get("client_session_id")
+                if not conversation_history:
+                    conversation_history = list(stored.get("conversation_history", []))
+                # Preserve Responses API metadata continuity. _create_agent()
+                # ignores these client instructions under the managed-only policy.
+                if instructions is None:
+                    instructions = stored.get("instructions")
 
         # Append new input messages to history (all but the last become history)
         for msg in input_messages[:-1]:
@@ -6653,13 +6662,23 @@ class APIServerAdapter(BasePlatformAdapter):
         if body.get("truncation") == "auto":
             conversation_history = _auto_truncate_response_history(conversation_history)
 
-        # An enabled client-managed ID is authoritative. Otherwise preserve
+        # An enabled client-managed ID is authoritative unless it identifies
+        # the client side of a response chain whose Hermes session rotated
+        # during compression. In that case the stored effective ID must win so
+        # the next turn resumes the post-compression session. Otherwise preserve
         # the fork's server-managed response-chain/UUID identity.
-        session_id = (
+        _resume_rotated_session = bool(
             provided_session_id
-            or stored_session_id
+            and stored_session_id
+            and stored_client_session_id == provided_session_id
+        )
+        session_id = (
+            stored_session_id if _resume_rotated_session else provided_session_id
+        ) or (
+            stored_session_id
             or str(uuid.uuid4())
         )
+        client_session_id = provided_session_id or stored_client_session_id
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
         route = self._resolve_route(body.get("model"))
@@ -6794,6 +6813,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 store=store,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                client_session_id=client_session_id,
             )
 
         async def _compute_response():
@@ -6809,8 +6829,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            fingerprint_body = dict(body)
+            fingerprint_body["_hermes_session_id"] = provided_session_id
+            fingerprint_body["_hermes_session_key"] = gateway_session_key
             fp = _make_request_fingerprint(
-                body,
+                fingerprint_body,
                 keys=[
                     "input",
                     "instructions",
@@ -6820,6 +6843,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "provider",
                     "model_options",
                     "tools",
+                    "_hermes_session_id",
+                    "_hermes_session_key",
                 ],
             )
             try:
@@ -6911,6 +6936,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_history": full_history,
                 "instructions": instructions,
                 "session_id": _effective_session_id,
+                "client_session_id": client_session_id,
             })
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
