@@ -526,7 +526,7 @@ class TestLoadGatewayConfig:
         """``gateway.api_server.port`` must land in PlatformConfig.extra —
         the adapter reads its platform-specific settings from extra
         (gateway/platforms/api_server.py), and from_dict discards unknown
-        top-level keys, so without the bridge the port is silently lost."""
+        top-level keys, so without the bridge these values are silently lost."""
         self._clear_api_server_env(monkeypatch)
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
@@ -542,7 +542,8 @@ class TestLoadGatewayConfig:
             "      provider: zipline\n"
             "      base_url: https://files.example.com\n"
             "      api_key: zipline-key\n"
-            "    openwebui_compact_event: true\n",
+            "    openwebui_compact_event: true\n"
+            "    responses_client_managed_session_id: true\n",
             encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -560,6 +561,7 @@ class TestLoadGatewayConfig:
             "api_key": "zipline-key",
         }
         assert extra["openwebui_compact_event"] is True
+        assert extra["responses_client_managed_session_id"] is True
 
     def test_room_link_url_from_nested_gateway_section(self, tmp_path, monkeypatch):
         """The supported config path advertises no endpoint until restart."""

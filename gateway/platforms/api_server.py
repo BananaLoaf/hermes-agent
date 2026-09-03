@@ -3,7 +3,7 @@ OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
 - POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
-- POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key and opt-in X-Hermes-Events supported)
+- POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; optional client-managed identity via X-Hermes-Session-Id; X-Hermes-Session-Key and opt-in X-Hermes-Events supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
@@ -1507,6 +1507,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._openwebui_compact_event: bool = _coerce_request_bool(
             extra.get("openwebui_compact_event"), default=False
         )
+        # Disabled by default so Responses API keeps its server-managed
+        # identity unless an operator explicitly delegates it to the client.
+        self._responses_client_managed_session_id: bool = _coerce_request_bool(
+            extra.get("responses_client_managed_session_id"), default=False
+        )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -2327,6 +2332,60 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        return raw, None
+
+    def _parse_session_id_header(
+        self, request: "web.Request"
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Extract and validate an optional ``X-Hermes-Session-Id``.
+
+        Session IDs reach on-disk artifact paths, so they receive the same
+        traversal checks as IDs supplied to the native session API.
+        """
+        raw = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if not raw:
+            return None, None
+
+        # A caller-selected ID can resume an existing transcript, so accept it
+        # only on an API surface protected by a configured shared key.
+        if not self._api_key:
+            logger.warning(
+                "Session continuation via X-Hermes-Session-Id rejected: "
+                "no API key configured.  Set API_SERVER_KEY to enable "
+                "session continuity."
+            )
+            return None, web.json_response(
+                _openai_error(
+                    "Session continuation requires API key authentication. "
+                    "Configure API_SERVER_KEY to enable this feature."
+                ),
+                status=403,
+            )
+
+        from gateway.session import _is_path_unsafe
+
+        # Session IDs are also used in artifact filenames. Keep traversal and
+        # control characters out at the HTTP boundary before the ID propagates.
+        if re.search(r'[\r\n\x00]', raw) or _is_path_unsafe(raw):
+            return None, web.json_response(
+                {
+                    "error": {
+                        "message": "Invalid session ID",
+                        "type": "invalid_request_error",
+                    }
+                },
+                status=400,
+            )
+        if len(raw) > self._MAX_SESSION_HEADER_LEN:
+            return None, web.json_response(
+                {
+                    "error": {
+                        "message": "Session ID too long",
+                        "type": "invalid_request_error",
+                    }
+                },
+                status=400,
+            )
         return raw, None
 
     # ------------------------------------------------------------------
@@ -3386,6 +3445,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "audio_api": False,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
+                "responses_client_managed_session_id": (
+                    self._responses_client_managed_session_id
+                ),
                 "session_key_header": "X-Hermes-Session-Key",
                 "extension_events_header": "X-Hermes-Events",
                 "cors": bool(self._cors_origins),
@@ -5259,37 +5321,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # only allowed when the API key is configured and the request is
         # authenticated.  Without this gate, any unauthenticated client could
         # read arbitrary session history by guessing/enumerating session IDs.
-        provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        provided_session_id, id_err = self._parse_session_id_header(request)
+        if id_err is not None:
+            return id_err
         if provided_session_id:
-            if not self._api_key:
-                logger.warning(
-                    "Session continuation via X-Hermes-Session-Id rejected: "
-                    "no API key configured.  Set API_SERVER_KEY to enable "
-                    "session continuity."
-                )
-                return web.json_response(
-                    _openai_error(
-                        "Session continuation requires API key authentication. "
-                        "Configure API_SERVER_KEY to enable this feature."
-                    ),
-                    status=403,
-                )
-            # Sanitize: reject control characters that could enable header
-            # injection, and path-traversal-shaped IDs that would escape the
-            # sessions directory when interpolated into on-disk artifact
-            # filenames (session snapshots, request dumps). Mirrors the native
-            # gateway's entry-boundary guard (gateway.session._is_path_unsafe).
-            from gateway.session import _is_path_unsafe
-            if re.search(r'[\r\n\x00]', provided_session_id) or _is_path_unsafe(provided_session_id):
-                return web.json_response(
-                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
-                    status=400,
-                )
-            if len(provided_session_id) > self._MAX_SESSION_HEADER_LEN:
-                return web.json_response(
-                    {"error": {"message": "Session ID too long", "type": "invalid_request_error"}},
-                    status=400,
-                )
             session_id = provided_session_id
             try:
                 db = await self._ensure_session_db_async()
@@ -6492,10 +6527,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if limited is not None:
             return limited
 
-        # Long-term memory scope header (see chat_completions for details).
+        # Session-Key identifies the declared conversation. Session-Id is an
+        # independent, operator-controlled extension parsed when enabled.
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        provided_session_id = None
+        if self._responses_client_managed_session_id:
+            provided_session_id, id_err = self._parse_session_id_header(request)
+            if id_err is not None:
+                return id_err
 
         # Parse request body
         try:
@@ -6542,9 +6583,8 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
 
-        # Accept explicit conversation_history from the request body.
-        # This lets stateless clients supply their own history instead of
-        # relying on server-side response chaining via previous_response_id.
+        # Accept the Hermes-specific conversation_history extension. This lets
+        # stateless clients separate prior messages from the current input.
         # Precedence: explicit conversation_history > previous_response_id.
         conversation_history: List[Dict[str, Any]] = []
         raw_history = body.get("conversation_history")
@@ -6613,9 +6653,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if body.get("truncation") == "auto":
             conversation_history = _auto_truncate_response_history(conversation_history)
 
-        # Reuse session from previous_response_id chain so the dashboard
-        # groups the entire conversation under one session entry.
-        session_id = stored_session_id or str(uuid.uuid4())
+        # An enabled client-managed ID is authoritative. Otherwise preserve
+        # the fork's server-managed response-chain/UUID identity.
+        session_id = (
+            provided_session_id
+            or stored_session_id
+            or str(uuid.uuid4())
+        )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
         route = self._resolve_route(body.get("model"))
