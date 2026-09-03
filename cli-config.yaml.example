@@ -974,6 +974,9 @@ group_sessions_per_user: true
 #         # Emit OpenWebUI-compatible context compaction status events for
 #         # streaming /v1/responses requests. Disabled by default.
 #         openwebui_compact_event: false
+#         # Let authenticated Responses API clients such as OpenWebUI select a
+#         # stable transcript with X-Hermes-Session-Id. Disabled by default.
+#         responses_client_managed_session_id: false
 #         model_routes:
 #           # Xiaozhi clients send model="minimax-m2" → routed to MiniMax via OpenRouter
 #           minimax-m2:
