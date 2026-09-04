@@ -3,17 +3,19 @@
 import asyncio
 import base64
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import ClassVar, Optional
 
 from gateway.outbound_files.config import OutboundFilesConfigError
 from gateway.outbound_files.provider import OutboundFileProvider
 
 
+@dataclass(frozen=True)
 class Base64OutboundFileProvider(OutboundFileProvider):
     """Inline supported images using the API server's legacy data URL format."""
 
-    max_image_size_bytes: ClassVar[int] = 5 * 1024 * 1024
+    max_image_size_bytes: int = 5 * 1024 * 1024
     image_mime_types: ClassVar[Mapping[str, str]] = {
         ".png": "image/png",
         ".jpg": "image/jpeg",
@@ -23,25 +25,16 @@ class Base64OutboundFileProvider(OutboundFileProvider):
         ".bmp": "image/bmp",
     }
 
-    def __init__(self, options: Mapping[str, Any]):
-        self.max_image_size_bytes = self._size_option(
-            options, "max_image_size_bytes", self.max_image_size_bytes
-        )
-        unknown = set(options) - {"max_image_size_bytes"}
-        if unknown:
-            names = ", ".join(sorted(str(key) for key in unknown))
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_image_size_bytes, bool)
+            or not isinstance(self.max_image_size_bytes, int)
+            or self.max_image_size_bytes <= 0
+        ):
             raise OutboundFilesConfigError(
-                f"unsupported outbound_files.base64 options: {names}"
+                "outbound_files.provider_options.max_image_size_bytes "
+                "must be a positive integer"
             )
-
-    @staticmethod
-    def _size_option(options: Mapping[str, Any], name: str, default: int) -> int:
-        value = options.get(name, default)
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise OutboundFilesConfigError(
-                f"outbound_files.provider_options.{name} must be a positive integer"
-            )
-        return value
 
     def _read_image(self, path: Path) -> Optional[bytes]:
         if path.suffix.lower() not in self.image_mime_types:

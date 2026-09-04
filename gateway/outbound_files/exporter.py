@@ -1,7 +1,6 @@
 """Outbound file provider construction and path validation."""
 
 import logging
-from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Optional
 
@@ -14,21 +13,22 @@ from gateway.platforms.base import validate_media_delivery_path
 logger = logging.getLogger(__name__)
 
 
-_PROVIDER_FACTORIES: dict[
-    str, Callable[[Mapping[str, Any]], OutboundFileProvider]
-] = {
+_PROVIDER_TYPES: dict[str, type[OutboundFileProvider]] = {
     "base64": Base64OutboundFileProvider,
     "none": OmittedOutboundFileProvider,
 }
 
 
 def create_outbound_file_provider(config: OutboundFilesConfig) -> OutboundFileProvider:
-    factory = _PROVIDER_FACTORIES.get(config.provider)
-    if factory is None:
+    try:
+        provider_type = _PROVIDER_TYPES[config.provider]
+    except KeyError:
         raise OutboundFilesConfigError(
             f"unsupported outbound_files.provider: {config.provider}"
-        )
-    return factory(config.provider_options)
+        ) from None
+    return provider_type.from_options(
+        config.provider_options, provider_name=config.provider
+    )
 
 
 class OutboundFileExporter:

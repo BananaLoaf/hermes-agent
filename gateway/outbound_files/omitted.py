@@ -1,29 +1,31 @@
 """Disabled provider for outbound API files."""
 
+from dataclasses import dataclass
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import ClassVar
 
-from gateway.outbound_files.base64 import Base64OutboundFileProvider
-from gateway.outbound_files.config import OutboundFilesConfigError
 from gateway.outbound_files.provider import OutboundFileProvider
 
 
+@dataclass(frozen=True)
 class OmittedOutboundFileProvider(OutboundFileProvider):
     """Hide local paths when outbound file delivery is disabled."""
 
-    def __init__(self, options: Mapping[str, Any]):
-        if options:
-            names = ", ".join(sorted(str(key) for key in options))
-            raise OutboundFilesConfigError(
-                f"unsupported outbound_files.none options: {names}"
-            )
+    image_mime_types: ClassVar[Mapping[str, str]] = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+    }
 
     def requires_valid_path(self, path: Path) -> bool:
         return False
 
     async def render(self, path: Path) -> str:
-        if path.suffix.lower() in Base64OutboundFileProvider.image_mime_types:
+        if path.suffix.lower() in self.image_mime_types:
             return "[IMAGE OMITTED]"
         return "[FILE OMITTED]"
 

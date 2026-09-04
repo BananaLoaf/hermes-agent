@@ -39,6 +39,21 @@ def _agent_result(text: str) -> tuple[dict, dict]:
     )
 
 
+_PROVIDER_OUTPUTS = [
+    pytest.param("base64", "data:image/png;base64,", id="base64"),
+    pytest.param("none", "[IMAGE OMITTED]", id="none"),
+]
+
+
+def _adapter_for_provider(provider: str) -> APIServerAdapter:
+    return APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"outbound_files": {"provider": provider}},
+        )
+    )
+
+
 @pytest.mark.asyncio
 async def test_media_tag_is_inlined_as_a_data_url(tmp_path):
     path = tmp_path / "shot.png"
@@ -73,14 +88,16 @@ async def test_base64_provider_enforces_configured_size_limit(tmp_path):
     document = tmp_path / "large.pdf"
     image.write_bytes(b"12345")
     document.write_bytes(b"12345")
-    provider = Base64OutboundFileProvider({"max_image_size_bytes": 4})
+    provider = Base64OutboundFileProvider.from_options(
+        {"max_image_size_bytes": 4}, provider_name="base64"
+    )
 
     assert await provider.render(image) is None
     assert await provider.render(document) == "[FILE OMITTED]"
 
 
 def test_base64_provider_preserves_legacy_default_limit():
-    provider = Base64OutboundFileProvider({})
+    provider = Base64OutboundFileProvider.from_options({}, provider_name="base64")
 
     assert provider.max_image_size_bytes == 5 * 1024 * 1024
 
@@ -110,7 +127,19 @@ async def test_none_provider_omits_images_and_other_files_without_exposing_paths
 @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "1024"])
 def test_base64_provider_rejects_invalid_size_limit(value):
     with pytest.raises(OutboundFilesConfigError, match="positive integer"):
-        Base64OutboundFileProvider({"max_image_size_bytes": value})
+        Base64OutboundFileProvider.from_options(
+            {"max_image_size_bytes": value}, provider_name="base64"
+        )
+
+
+@pytest.mark.parametrize("provider", ["base64", "none"])
+def test_provider_rejects_options_not_declared_by_its_dataclass(provider):
+    config = OutboundFilesConfig.from_dict(
+        {"provider": provider, "provider_options": {"unknown": True}}
+    )
+
+    with pytest.raises(OutboundFilesConfigError, match=f"{provider}.*unknown"):
+        create_outbound_file_provider(config)
 
 
 def test_provider_options_must_be_nested():
@@ -163,11 +192,14 @@ async def test_streaming_processor_holds_only_media_candidate(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_non_streaming_renders_media(tmp_path):
+@pytest.mark.parametrize(("provider", "expected"), _PROVIDER_OUTPUTS)
+async def test_chat_completions_non_streaming_renders_media(
+    tmp_path, provider, expected
+):
     path = tmp_path / "completion.png"
     path.write_bytes(b"png")
     raw = f"Ready\nMEDIA:{path}\nDone"
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    adapter = _adapter_for_provider(provider)
 
     with patch.object(
         adapter, "_run_agent", new=AsyncMock(return_value=_agent_result(raw))
@@ -185,15 +217,18 @@ async def test_chat_completions_non_streaming_renders_media(tmp_path):
     content = payload["choices"][0]["message"]["content"]
     assert response.status == 200
     assert str(path) not in content
-    assert "data:image/png;base64," in content
+    assert expected in content
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_streaming_renders_split_media(tmp_path):
+@pytest.mark.parametrize(("provider", "expected"), _PROVIDER_OUTPUTS)
+async def test_chat_completions_streaming_renders_split_media(
+    tmp_path, provider, expected
+):
     path = tmp_path / "completion-stream.png"
     path.write_bytes(b"png")
     raw = f"Ready\nMEDIA:{path}\nDone"
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    adapter = _adapter_for_provider(provider)
 
     async def run_agent(**kwargs):
         callback = kwargs["stream_delta_callback"]
@@ -216,15 +251,16 @@ async def test_chat_completions_streaming_renders_split_media(tmp_path):
 
     assert response.status == 200
     assert str(path) not in wire_output
-    assert "data:image/png;base64," in wire_output
+    assert expected in wire_output
 
 
 @pytest.mark.asyncio
-async def test_responses_non_streaming_renders_media(tmp_path):
+@pytest.mark.parametrize(("provider", "expected"), _PROVIDER_OUTPUTS)
+async def test_responses_non_streaming_renders_media(tmp_path, provider, expected):
     path = tmp_path / "response.png"
     path.write_bytes(b"png")
     raw = f"Ready\nMEDIA:{path}\nDone"
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    adapter = _adapter_for_provider(provider)
 
     with patch.object(
         adapter, "_run_agent", new=AsyncMock(return_value=_agent_result(raw))
@@ -239,15 +275,18 @@ async def test_responses_non_streaming_renders_media(tmp_path):
     content = payload["output"][-1]["content"][0]["text"]
     assert response.status == 200
     assert str(path) not in content
-    assert "data:image/png;base64," in content
+    assert expected in content
 
 
 @pytest.mark.asyncio
-async def test_responses_streaming_endpoint_renders_split_media(tmp_path):
+@pytest.mark.parametrize(("provider", "expected"), _PROVIDER_OUTPUTS)
+async def test_responses_streaming_endpoint_renders_split_media(
+    tmp_path, provider, expected
+):
     path = tmp_path / "response-stream.png"
     path.write_bytes(b"png")
     raw = f"Ready\nMEDIA:{path}\nDone"
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    adapter = _adapter_for_provider(provider)
 
     async def run_agent(**kwargs):
         callback = kwargs["stream_delta_callback"]
@@ -270,7 +309,7 @@ async def test_responses_streaming_endpoint_renders_split_media(tmp_path):
 
     assert response.status == 200
     assert str(path) not in wire_output
-    assert "data:image/png;base64," in wire_output
+    assert expected in wire_output
 
 
 @pytest.mark.asyncio
