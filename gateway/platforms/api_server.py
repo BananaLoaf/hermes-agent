@@ -1588,6 +1588,12 @@ class APIServerAdapter(BasePlatformAdapter):
         """Render a complete one-shot response through the egress processor."""
         return await self._new_outbound_response_processor().render(text)
 
+    def _with_outbound_files_prompt(self, prompt: Optional[str]) -> str:
+        """Append the active provider's delivery contract to managed instructions."""
+        parts = [prompt.strip()] if isinstance(prompt, str) and prompt.strip() else []
+        parts.append(self._outbound_files.system_prompt_hint())
+        return "\n\n".join(parts)
+
     @staticmethod
     async def _render_outbound_transcript(
         processor: MediaResponseProcessor,
@@ -3195,7 +3201,9 @@ class APIServerAdapter(BasePlatformAdapter):
             "max_iterations": max_iterations,
             "quiet_mode": True,
             "verbose_logging": False,
-            "ephemeral_system_prompt": managed_system_prompt or None,
+            "ephemeral_system_prompt": self._with_outbound_files_prompt(
+                managed_system_prompt
+            ),
             "enabled_toolsets": enabled_toolsets,
             "session_id": session_id,
             "platform": "api_server",
