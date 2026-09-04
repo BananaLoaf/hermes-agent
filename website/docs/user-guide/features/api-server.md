@@ -671,10 +671,51 @@ gateway:
     key: your-secret-key
     cors_origins: http://localhost:3000
     model_name: my-hermes
+    outbound_files:
+      provider: base64
+      max_size_bytes: 5242880
     max_concurrent_runs: 10   # concurrent-run cap; 0 disables the limit
 ```
 
-`port`, `key`, `host`, `cors_origins`, and `model_name` are automatically bridged into the platform's `extra` settings, so they behave exactly like their `API_SERVER_*` environment-variable counterparts. Environment variables take precedence over `config.yaml` values. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
+`port`, `key`, `host`, `cors_origins`, `model_name`, and `outbound_files` are automatically bridged into the platform's `extra` settings, so they behave exactly like their `API_SERVER_*` environment-variable counterparts. Environment variables take precedence over `config.yaml` values. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
+
+### Outbound media
+
+The API server replaces supported `MEDIA:/absolute/path` image directives with
+base64 data URLs before sending them to clients. This also applies when a
+`MEDIA:` marker or its path is split across streaming deltas; ordinary text is
+still forwarded immediately.
+
+Two outbound file providers are available:
+
+- `base64` inlines PNG, JPEG, GIF, WebP, and BMP images as data URLs. Its
+  `max_size_bytes` option defaults to 5 MiB and must be a positive integer.
+  Unsupported, missing, or oversized files keep their original directive.
+- `none` disables file delivery. Image directives become `[IMAGE OMITTED]` and
+  all other file directives become `[FILE OMITTED]`; local paths are never
+  exposed.
+
+Use the `none` provider when API clients must not receive file contents:
+
+```yaml
+gateway:
+  api_server:
+    outbound_files:
+      provider: none
+```
+
+An explicit YAML `null` has the same meaning:
+
+```yaml
+gateway:
+  api_server:
+    outbound_files:
+      provider: null
+```
+
+If the entire `outbound_files` block is omitted, the provider remains `base64`
+for backward compatibility. This differs from explicitly setting its
+`provider` to `null`.
 
 ### Concurrent-run cap
 
