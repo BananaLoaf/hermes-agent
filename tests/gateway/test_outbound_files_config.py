@@ -1,3 +1,4 @@
+import base64
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -7,8 +8,10 @@ import pytest
 
 from gateway.media_response_processor import MediaResponseProcessor
 from gateway.outbound_files import (
+    Base64OutboundFileProvider,
     OutboundFileExporter,
     OutboundFileProvider,
+    OutboundFileUploadError,
     OutboundFilesConfig,
     OutboundFilesConfigError,
     UploadedFile,
@@ -33,6 +36,52 @@ def _root(**overrides):
 
 def test_missing_section_disables_outbound_files():
     assert OutboundFilesConfig.from_dict(None) is None
+
+
+def test_creates_base64_provider_with_default_limit():
+    config = OutboundFilesConfig.from_dict({"provider": "base64"})
+
+    provider = create_outbound_file_provider(config)
+
+    assert isinstance(provider, Base64OutboundFileProvider)
+    assert provider.max_size_bytes == 1024 * 1024
+
+
+@pytest.mark.parametrize("max_size", [True, False, 0, -1, 1.5, "1024"])
+def test_base64_provider_rejects_invalid_size_limit(max_size):
+    config = OutboundFilesConfig.from_dict(
+        {"provider": "base64", "max_size_bytes": max_size}
+    )
+
+    with pytest.raises(
+        OutboundFilesConfigError,
+        match="max_size_bytes must be a positive integer",
+    ):
+        create_outbound_file_provider(config)
+
+
+@pytest.mark.asyncio
+async def test_base64_provider_returns_data_url(tmp_path):
+    path = tmp_path / "report.pdf"
+    contents = b"small report"
+    path.write_bytes(contents)
+    provider = Base64OutboundFileProvider({"max_size_bytes": len(contents)})
+
+    uploaded = await provider.upload(path, expiry="7d")
+
+    assert uploaded.url == (
+        "data:application/pdf;base64," + base64.b64encode(contents).decode("ascii")
+    )
+
+
+@pytest.mark.asyncio
+async def test_base64_provider_rejects_file_over_limit(tmp_path):
+    path = tmp_path / "large.bin"
+    path.write_bytes(b"12345")
+    provider = Base64OutboundFileProvider({"max_size_bytes": 4})
+
+    with pytest.raises(OutboundFileUploadError, match="exceeds base64 size limit"):
+        await provider.upload(path, expiry=None)
 
 
 @pytest.mark.parametrize(

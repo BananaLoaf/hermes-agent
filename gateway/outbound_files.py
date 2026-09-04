@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import mimetypes
 import re
@@ -324,6 +325,42 @@ class OutboundFileProvider(ABC):
         """Upload ``path`` with an optional relative expiry duration."""
 
 
+class Base64OutboundFileProvider(OutboundFileProvider):
+    """Embed small local files in data URLs without an external service."""
+
+    _DEFAULT_MAX_SIZE_BYTES = 1024 * 1024
+
+    def __init__(self, options: Mapping[str, Any]):
+        max_size = options.get("max_size_bytes", self._DEFAULT_MAX_SIZE_BYTES)
+        if isinstance(max_size, bool) or not isinstance(max_size, int) or max_size <= 0:
+            raise OutboundFilesConfigError(
+                "outbound_files.max_size_bytes must be a positive integer"
+            )
+        self._max_size_bytes = max_size
+
+    @property
+    def max_size_bytes(self) -> int:
+        return self._max_size_bytes
+
+    def _read_bounded(self, path: Path) -> bytes:
+        if not path.is_file():
+            raise OutboundFileUploadError("outbound upload source is not a file")
+        try:
+            with path.open("rb") as file_handle:
+                data = file_handle.read(self._max_size_bytes + 1)
+        except OSError as exc:
+            raise OutboundFileUploadError("outbound file read failed") from exc
+        if len(data) > self._max_size_bytes:
+            raise OutboundFileUploadError("outbound file exceeds base64 size limit")
+        return data
+
+    async def upload(self, path: Path, *, expiry: Optional[str]) -> UploadedFile:
+        del expiry  # Data URLs have no server-side expiration.
+        data = await asyncio.to_thread(self._read_bounded, path)
+        encoded = base64.b64encode(data).decode("ascii")
+        return UploadedFile(url=f"data:{_content_type_for_path(path)};base64,{encoded}")
+
+
 class ZiplineOutboundFileProvider(OutboundFileProvider):
     """Upload files through Zipline's multipart API."""
 
@@ -398,6 +435,7 @@ class ZiplineOutboundFileProvider(OutboundFileProvider):
 
 
 _PROVIDER_FACTORIES: dict[str, Callable[[Mapping[str, Any]], OutboundFileProvider]] = {
+    "base64": Base64OutboundFileProvider,
     "zipline": ZiplineOutboundFileProvider,
 }
 
