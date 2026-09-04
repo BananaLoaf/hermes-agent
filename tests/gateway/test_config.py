@@ -545,7 +545,8 @@ class TestLoadGatewayConfig:
             "    model_name: my-hermes\n"
             "    outbound_files:\n"
             "      provider: base64\n"
-            "      max_size_bytes: 1024\n",
+            "      provider_options:\n"
+            "        max_image_size_bytes: 1024\n",
             encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -559,7 +560,9 @@ class TestLoadGatewayConfig:
         assert extra["model_name"] == "my-hermes"
         assert extra["outbound_files"] == {
             "provider": "base64",
-            "max_size_bytes": 1024,
+            "provider_options": {
+                "max_image_size_bytes": 1024,
+            },
         }
 
     def test_room_link_url_from_nested_gateway_section(self, tmp_path, monkeypatch):

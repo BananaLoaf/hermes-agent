@@ -1134,6 +1134,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     async def _render_outbound_text(self, text: str) -> str:
         return await self._new_media_response_processor().render(text)
+
+    def _with_outbound_files_prompt(self, prompt: Optional[str]) -> str:
+        parts = [prompt.strip()] if isinstance(prompt, str) and prompt.strip() else []
+        parts.append(self._outbound_files.system_prompt_hint())
+        return "\n\n".join(parts)
         # Shared broker; this adapter maps HTTP registration + controller WS onto it.
         self._browser_control_broker = get_browser_control_broker()
         # One-shot artifact transport: lazy per-profile stores + limiter (tests inject).
@@ -2116,7 +2121,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         agent_kwargs = {
             "model": model, **runtime_kwargs, **_checkpoint_agent_kwargs(user_config),
             "max_iterations": max_iterations, "quiet_mode": True, "verbose_logging": False,
-            "ephemeral_system_prompt": ephemeral_system_prompt or None,
+            "ephemeral_system_prompt": self._with_outbound_files_prompt(
+                ephemeral_system_prompt
+            ),
             "enabled_toolsets": enabled_toolsets, "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,

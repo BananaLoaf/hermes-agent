@@ -673,15 +673,10 @@ class TestPromptBuilderConstants:
 
 
     def test_api_server_hint_scopes_media_tag_guidance(self):
-        """The API hint describes base64 MEDIA handling on every endpoint."""
+        """Provider-specific media guidance is injected by the API adapter."""
         hint = PLATFORM_HINTS["api_server"]
-        assert "MEDIA:" in hint
-        assert "inlined" in hint.lower()
-        assert "data" in hint.lower()
-        assert "every api response endpoint" in hint.lower()
-        assert "streaming" in hint.lower()
-        assert "non-image" in hint.lower()
-        assert "plain" in hint.lower()
+        assert "MEDIA:" not in hint
+        assert "base64" not in hint.lower()
 
     def test_markdown_converting_platform_hints_do_not_forbid_markdown(self):
         """#12224 — WhatsApp (Baileys) and Signal adapters actively convert

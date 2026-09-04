@@ -723,12 +723,7 @@ PLATFORM_HINTS = {
         "You're responding through an API server. The rendering layer is unknown — "
         "assume plain text. No markdown formatting (no asterisks, bullets, headers, "
         "code fences). Treat this like a conversation, not a document. Keep responses "
-        "brief and natural. "
-        "File/media delivery: images referenced as MEDIA:/absolute/path tags "
-        "(.png/.jpg/.jpeg/.gif/.webp/.bmp, up to 5MB) are inlined as base64 data "
-        "URLs on every API response endpoint, including streaming responses. "
-        "Non-image files are not inlined; state their plain file path in your "
-        "response text instead of using a MEDIA: tag."
+        "brief and natural."
     ),
     # No "webui" hint on purpose: nothing constructs platform="webui" (the dashboard chat resolves to
     # 'desktop' or 'tui'). If a real WebUI chat surface ships, write a hint from its actual renderer.

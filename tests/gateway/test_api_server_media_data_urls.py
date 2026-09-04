@@ -4,12 +4,16 @@ import base64
 import asyncio
 import time
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 pytest.importorskip("aiohttp")
 
+from aiohttp import web  # noqa: E402
+from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
+
+from gateway.config import PlatformConfig  # noqa: E402
 from gateway.outbound_files import (  # noqa: E402
     Base64OutboundFileProvider,
     OmittedOutboundFileProvider,
@@ -19,6 +23,20 @@ from gateway.outbound_files import (  # noqa: E402
     OutboundFilesConfig,
 )
 from gateway.platforms.api_server import APIServerAdapter  # noqa: E402
+
+
+def _openai_app(adapter: APIServerAdapter) -> web.Application:
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post("/v1/responses", adapter._handle_responses)
+    return app
+
+
+def _agent_result(text: str) -> tuple[dict, dict]:
+    return (
+        {"final_response": text, "messages": [], "api_calls": 1},
+        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
 
 
 @pytest.mark.asyncio
@@ -36,7 +54,7 @@ async def test_media_tag_is_inlined_as_a_data_url(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_non_image_and_missing_media_are_left_untouched(tmp_path):
+async def test_non_image_is_omitted_and_missing_image_is_left_untouched(tmp_path):
     document = tmp_path / "report.pdf"
     document.write_bytes(b"pdf")
     missing = tmp_path / "missing.png"
@@ -45,23 +63,26 @@ async def test_non_image_and_missing_media_are_left_untouched(tmp_path):
 
     document_text = f"MEDIA:{document}"
     missing_text = f"MEDIA:{missing}"
-    assert await adapter._render_outbound_text(document_text) == document_text
+    assert await adapter._render_outbound_text(document_text) == "[FILE OMITTED]"
     assert await adapter._render_outbound_text(missing_text) == missing_text
 
 
 @pytest.mark.asyncio
 async def test_base64_provider_enforces_configured_size_limit(tmp_path):
-    path = tmp_path / "large.png"
-    path.write_bytes(b"12345")
-    provider = Base64OutboundFileProvider({"max_size_bytes": 4})
+    image = tmp_path / "large.png"
+    document = tmp_path / "large.pdf"
+    image.write_bytes(b"12345")
+    document.write_bytes(b"12345")
+    provider = Base64OutboundFileProvider({"max_image_size_bytes": 4})
 
-    assert await provider.render(path) is None
+    assert await provider.render(image) is None
+    assert await provider.render(document) == "[FILE OMITTED]"
 
 
 def test_base64_provider_preserves_legacy_default_limit():
     provider = Base64OutboundFileProvider({})
 
-    assert provider.max_size_bytes == 5 * 1024 * 1024
+    assert provider.max_image_size_bytes == 5 * 1024 * 1024
 
 
 def test_unknown_provider_is_rejected():
@@ -89,7 +110,40 @@ async def test_none_provider_omits_images_and_other_files_without_exposing_paths
 @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "1024"])
 def test_base64_provider_rejects_invalid_size_limit(value):
     with pytest.raises(OutboundFilesConfigError, match="positive integer"):
-        Base64OutboundFileProvider({"max_size_bytes": value})
+        Base64OutboundFileProvider({"max_image_size_bytes": value})
+
+
+def test_provider_options_must_be_nested():
+    with pytest.raises(OutboundFilesConfigError, match="unsupported.*max_image"):
+        OutboundFilesConfig.from_dict(
+            {"provider": "base64", "max_image_size_bytes": 1024}
+        )
+
+
+def test_outbound_system_prompt_matches_provider():
+    base64_exporter = OutboundFileExporter.from_dict(
+        {
+            "provider": "base64",
+            "provider_options": {
+                "max_image_size_bytes": 1024,
+            },
+        }
+    )
+    none_exporter = OutboundFileExporter.from_dict({"provider": None})
+
+    assert "Images up to 1024 bytes" in base64_exporter.system_prompt_hint()
+    assert "replaced with [FILE OMITTED]" in base64_exporter.system_prompt_hint()
+    assert "delivery is disabled" in none_exporter.system_prompt_hint()
+
+
+def test_adapter_appends_provider_hint_to_request_system_prompt():
+    adapter = object.__new__(APIServerAdapter)
+    adapter._outbound_files = OutboundFileExporter.from_dict({"provider": "none"})
+
+    prompt = adapter._with_outbound_files_prompt("Client instruction")
+
+    assert prompt.startswith("Client instruction\n\n")
+    assert "delivery is disabled" in prompt
 
 
 @pytest.mark.asyncio
@@ -106,6 +160,117 @@ async def test_streaming_processor_holds_only_media_candidate(tmp_path):
 
     assert rendered.startswith("![image](data:image/png;base64,")
     assert rendered.endswith("\nDone")
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_non_streaming_renders_media(tmp_path):
+    path = tmp_path / "completion.png"
+    path.write_bytes(b"png")
+    raw = f"Ready\nMEDIA:{path}\nDone"
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+
+    with patch.object(
+        adapter, "_run_agent", new=AsyncMock(return_value=_agent_result(raw))
+    ):
+        async with TestClient(TestServer(_openai_app(adapter))) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "create an image"}],
+                },
+            )
+            payload = await response.json()
+
+    content = payload["choices"][0]["message"]["content"]
+    assert response.status == 200
+    assert str(path) not in content
+    assert "data:image/png;base64," in content
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_streaming_renders_split_media(tmp_path):
+    path = tmp_path / "completion-stream.png"
+    path.write_bytes(b"png")
+    raw = f"Ready\nMEDIA:{path}\nDone"
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+
+    async def run_agent(**kwargs):
+        callback = kwargs["stream_delta_callback"]
+        callback("Ready\nMED")
+        callback(f"IA:{str(path)[:-4]}")
+        callback(".png\nDone")
+        return _agent_result(raw)
+
+    with patch.object(adapter, "_run_agent", side_effect=run_agent):
+        async with TestClient(TestServer(_openai_app(adapter))) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "create an image"}],
+                    "stream": True,
+                },
+            )
+            wire_output = await response.text()
+
+    assert response.status == 200
+    assert str(path) not in wire_output
+    assert "data:image/png;base64," in wire_output
+
+
+@pytest.mark.asyncio
+async def test_responses_non_streaming_renders_media(tmp_path):
+    path = tmp_path / "response.png"
+    path.write_bytes(b"png")
+    raw = f"Ready\nMEDIA:{path}\nDone"
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+
+    with patch.object(
+        adapter, "_run_agent", new=AsyncMock(return_value=_agent_result(raw))
+    ):
+        async with TestClient(TestServer(_openai_app(adapter))) as client:
+            response = await client.post(
+                "/v1/responses",
+                json={"model": "hermes-agent", "input": "create an image"},
+            )
+            payload = await response.json()
+
+    content = payload["output"][-1]["content"][0]["text"]
+    assert response.status == 200
+    assert str(path) not in content
+    assert "data:image/png;base64," in content
+
+
+@pytest.mark.asyncio
+async def test_responses_streaming_endpoint_renders_split_media(tmp_path):
+    path = tmp_path / "response-stream.png"
+    path.write_bytes(b"png")
+    raw = f"Ready\nMEDIA:{path}\nDone"
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+
+    async def run_agent(**kwargs):
+        callback = kwargs["stream_delta_callback"]
+        callback("Ready\nMED")
+        callback(f"IA:{str(path)[:-4]}")
+        callback(".png\nDone")
+        return _agent_result(raw)
+
+    with patch.object(adapter, "_run_agent", side_effect=run_agent):
+        async with TestClient(TestServer(_openai_app(adapter))) as client:
+            response = await client.post(
+                "/v1/responses",
+                json={
+                    "model": "hermes-agent",
+                    "input": "create an image",
+                    "stream": True,
+                },
+            )
+            wire_output = await response.text()
+
+    assert response.status == 200
+    assert str(path) not in wire_output
+    assert "data:image/png;base64," in wire_output
 
 
 @pytest.mark.asyncio

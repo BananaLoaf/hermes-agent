@@ -673,7 +673,8 @@ gateway:
     model_name: my-hermes
     outbound_files:
       provider: base64
-      max_size_bytes: 5242880
+      provider_options:
+        max_image_size_bytes: 5242880
     max_concurrent_runs: 10   # concurrent-run cap; 0 disables the limit
 ```
 
@@ -688,9 +689,10 @@ still forwarded immediately.
 
 Two outbound file providers are available:
 
-- `base64` inlines PNG, JPEG, GIF, WebP, and BMP images as data URLs. Its
-  `max_size_bytes` option defaults to 5 MiB and must be a positive integer.
-  Unsupported, missing, or oversized files keep their original directive.
+- `base64` inlines PNG, JPEG, GIF, WebP, and BMP images as image data URLs.
+  Its `max_image_size_bytes` option defaults to 5 MiB and must be a positive
+  integer. Non-image directives are replaced with `[FILE OMITTED]`. Missing or
+  oversized images keep their original directive.
 - `none` disables file delivery. Image directives become `[IMAGE OMITTED]` and
   all other file directives become `[FILE OMITTED]`; local paths are never
   exposed.
@@ -716,6 +718,22 @@ gateway:
 If the entire `outbound_files` block is omitted, the provider remains `base64`
 for backward compatibility. This differs from explicitly setting its
 `provider` to `null`.
+
+Provider-specific settings belong under `provider_options`:
+
+```yaml
+gateway:
+  api_server:
+    outbound_files:
+      provider: base64
+      provider_options:
+        max_image_size_bytes: 5242880
+```
+
+The API server also adds provider-specific delivery guidance to the agent's
+system instruction. The `base64` instruction describes both configured size
+limit and its image-only behavior; the `none` instruction tells the agent that
+file delivery is disabled.
 
 ### Concurrent-run cap
 
