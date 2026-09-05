@@ -525,6 +525,8 @@ async def _handle_runs(
         if stored:
             conversation_history = list(stored.get("conversation_history", []))
             stored_session_id = stored.get("session_id")
+            # Preserve Responses/Runs metadata continuity. _create_agent() applies the configured
+            # managed-vs-client prompt policy.
             if instructions is None:
                 instructions = stored.get("instructions")
 

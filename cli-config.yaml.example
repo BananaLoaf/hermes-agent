@@ -1191,6 +1191,13 @@ gateway:
   # if an agent has not unwound. Keep it below the service-manager stop budget.
   # signal_interrupt_grace_timeout: 1
 
+  # By default, API-server requests use the operator-managed prompt configured
+  # by agent.system_prompt or display.personality and ignore client `system`
+  # messages / `instructions`. Opt in only when authenticated API clients are
+  # trusted to manage the additional prompt for each request.
+  # api_server:
+  #   client_managed_system_prompt: false
+
 # =============================================================================
 # Toolsets
 # =============================================================================

@@ -1656,6 +1656,7 @@ def load_gateway_config() -> GatewayConfig:
                     "outbound_files",
                     "openwebui_compact_event",
                     "responses_client_managed_session_id",
+                    "client_managed_system_prompt",
                 ):
                     if _bridge_key in _api_plat and _bridge_key not in _api_extra:
                         _api_extra[_bridge_key] = _api_plat.pop(_bridge_key)

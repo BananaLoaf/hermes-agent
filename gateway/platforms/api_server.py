@@ -1515,6 +1515,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._responses_client_managed_session_id: bool = _coerce_request_bool(
             extra.get("responses_client_managed_session_id"), default=False
         )
+        # Positive opt-in: managed deployment policy remains authoritative by default.
+        self._client_managed_system_prompt: bool = _coerce_request_bool(
+            extra.get("client_managed_system_prompt"), default=False
+        )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -2911,10 +2915,10 @@ class APIServerAdapter(BasePlatformAdapter):
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
 
-        Client-provided ``system`` messages and Responses API ``instructions``
-        are intentionally ignored.  The API server always uses the
-        operator-managed ``agent.system_prompt`` resolved inside the active
-        profile scope.
+        Unless ``client_managed_system_prompt`` is enabled, client ``system``
+        messages and Responses/Runs ``instructions`` are compatibility
+        metadata only and the operator-managed prompt from the active profile
+        wins.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -3178,14 +3182,16 @@ class APIServerAdapter(BasePlatformAdapter):
             else GatewayRunner._load_reasoning_config(model)
         )
 
-        # API clients are outside the operator trust boundary.  Do not let a
-        # Chat Completions `system` message or Responses `instructions`
-        # replace the deployment-managed instruction.  This lookup runs while
-        # _run_agent() holds the request's profile scope, so multiplexed routes
-        # resolve the managed config belonging to that profile.
-        managed_system_prompt = (
-            GatewayRunner._load_ephemeral_system_prompt() or ""
-        ).strip()
+        if self._client_managed_system_prompt:
+            effective_system_prompt = ephemeral_system_prompt or ""
+        else:
+            # This lookup runs while _run_agent() holds the request's profile
+            # scope, so multiplexed routes resolve the managed config belonging
+            # to that profile. API clients cannot replace operator policy
+            # without the explicit opt-in.
+            effective_system_prompt = (
+                GatewayRunner._load_ephemeral_system_prompt() or ""
+            ).strip()
 
         agent_kwargs = {
             "model": model,
@@ -3195,7 +3201,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "quiet_mode": True,
             "verbose_logging": False,
             "ephemeral_system_prompt": self._with_outbound_files_prompt(
-                managed_system_prompt
+                effective_system_prompt
             ),
             "enabled_toolsets": enabled_toolsets,
             "session_id": session_id,
@@ -5269,8 +5275,8 @@ class APIServerAdapter(BasePlatformAdapter):
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
         # Parse client system text for OpenAI request compatibility and the
-        # stateless session fingerprint only. _create_agent() enforces the
-        # managed-only policy and never passes this text to the model.
+        # stateless session fingerprint. _create_agent() sends this text to the
+        # model only when client-managed prompts are enabled.
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
 
@@ -6642,7 +6648,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not conversation_history:
                     conversation_history = list(stored.get("conversation_history", []))
                 # Preserve Responses API metadata continuity. _create_agent()
-                # ignores these client instructions under the managed-only policy.
+                # applies the configured managed-vs-client prompt policy.
                 if instructions is None:
                     instructions = stored.get("instructions")
 
