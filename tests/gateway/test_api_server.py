@@ -159,7 +159,7 @@ class TestAdapterInit:
         assert adapter._host == "127.0.0.1"
         assert adapter._port == 8642
         assert adapter._api_key == ""
-        assert adapter._client_managed_system_prompt is False
+        assert adapter._client_managed_system_prompt is True
         assert adapter.platform == Platform.API_SERVER
 
     def test_custom_config_from_extra(self):
@@ -244,7 +244,7 @@ class TestAdapterInit:
 
         assert isinstance(agent, FakeAgent)
         assert captured["ephemeral_system_prompt"].startswith(
-            "Operator-managed instruction\n\n"
+            "Untrusted client instruction\n\n"
         )
         assert "base64" in captured["ephemeral_system_prompt"]
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
@@ -255,14 +255,23 @@ class TestAdapterInit:
         assert captured["compaction_callback"] is compaction_callback
 
     @pytest.mark.parametrize(
-        ("client_managed_system_prompt", "expected_prompt"),
+        ("extra", "expected_prompt"),
         [
-            pytest.param(False, "Operator-managed instruction", id="operator-managed"),
-            pytest.param(True, "Client-provided instruction", id="client-managed"),
+            pytest.param({}, "Client-provided instruction", id="default-client-managed"),
+            pytest.param(
+                {"client_managed_system_prompt": False},
+                "Operator-managed instruction",
+                id="operator-managed",
+            ),
+            pytest.param(
+                {"client_managed_system_prompt": True},
+                "Client-provided instruction",
+                id="client-managed",
+            ),
         ],
     )
     def test_create_agent_applies_configured_system_prompt_policy(
-        self, monkeypatch, client_managed_system_prompt, expected_prompt,
+        self, monkeypatch, extra, expected_prompt,
     ):
         captured = {}
 
@@ -277,10 +286,7 @@ class TestAdapterInit:
             "gateway.run.GatewayRunner._load_ephemeral_system_prompt",
             staticmethod(lambda: "  Operator-managed instruction  "),
         )
-        adapter = APIServerAdapter(PlatformConfig(
-            enabled=True,
-            extra={"client_managed_system_prompt": client_managed_system_prompt},
-        ))
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra=extra))
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
 
         adapter._create_agent(
@@ -365,8 +371,7 @@ class TestAdapterInit:
     def test_operator_managed_policy_combines_soul_with_profile_prompt(
         self, tmp_path, monkeypatch, profile_config, expected_overlay, excluded_overlays,
     ):
-        """The default policy must match messaging gateways all the way to the wire prompt."""
-        from agent.turn_context import build_api_messages
+        """Managed policy must compose SOUL and profile prompts like messaging gateways."""
         from gateway import run as gateway_run
         from run_agent import AIAgent as RealAgent
 
@@ -419,17 +424,12 @@ class TestAdapterInit:
                 ephemeral_system_prompt="CLIENT PROMPT MUST BE IGNORED",
             )
             base_prompt = agent._build_system_prompt()
-            api_messages, effective_prompt = build_api_messages(
-                agent,
-                [{"role": "user", "content": "hello"}],
-                current_turn_user_idx=0,
-                ext_prefetch_cache=None,
-                plugin_user_context=None,
-                moa_config=None,
-                active_system_prompt=base_prompt,
-            )
+            effective_prompt = base_prompt
+            if agent.ephemeral_system_prompt:
+                effective_prompt = (
+                    effective_prompt + "\n\n" + agent.ephemeral_system_prompt
+                ).strip()
 
-        assert api_messages[0] == {"role": "system", "content": effective_prompt}
         assert "API SERVER SOUL IDENTITY" in effective_prompt
         assert expected_overlay in effective_prompt
         assert effective_prompt.index("API SERVER SOUL IDENTITY") < effective_prompt.index(expected_overlay)

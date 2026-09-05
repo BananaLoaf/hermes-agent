@@ -3336,10 +3336,10 @@ DEFAULT_CONFIG = {
         # OpenAI-compatible API server platform
         # (gateway/platforms/api_server.py).
         "api_server": {
-            # Let authenticated API clients replace the operator-managed agent.system_prompt with
-            # Chat Completions system messages or Responses/Runs instructions. Off by default so
-            # deployment policy remains authoritative.
-            "client_managed_system_prompt": False,
+            # Preserve the established behavior in which authenticated API clients supply Chat
+            # Completions system messages or Responses/Runs instructions. Set false to make the
+            # active profile's display.personality or agent.system_prompt authoritative instead.
+            "client_managed_system_prompt": True,
             # Maximum number of agent runs the API server will service
             # concurrently. Requests to /v1/chat/completions, /v1/responses,
             # and /v1/runs that arrive while this many runs are already

@@ -640,24 +640,23 @@ Rules: max 256 chars, control characters (`\r`, `\n`, `\x00`) are rejected, and 
 
 ## System Prompt Handling
 
-By default, the API server ignores client-provided `system` messages (Chat Completions) and
-`instructions` fields (Responses and Runs). It uses the operator-managed prompt from the active
-profile's `display.personality` or `agent.system_prompt`, layered on top of the Hermes core prompt.
-This keeps deployment policy authoritative across OpenAI-compatible clients and multiplexed
-profile routes.
+By default, the API server preserves its established client-managed behavior: Chat Completions
+`system` messages and Responses/Runs `instructions` supply the additional prompt for that request.
+The Hermes core prompt, profile SOUL, tools, memory, and skills remain intact.
 
-To let authenticated clients manage this additional prompt instead, enable the explicit opt-in:
+To make the active profile's operator-managed prompt authoritative instead, disable client-managed
+system prompts:
 
 ```yaml
 gateway:
   api_server:
-    client_managed_system_prompt: true
+    client_managed_system_prompt: false
 ```
 
-When enabled, Chat Completions `system` messages and Responses/Runs `instructions` replace the
-operator-managed additional prompt for that request. The Hermes core prompt, profile SOUL, tools,
-memory, and skills remain intact. Client prompt fields are still parsed and retained as protocol
-metadata when the option is disabled, so request fingerprints and Responses chaining stay stable.
+When disabled, the active profile's `display.personality` is used as the additional prompt, falling
+back to `agent.system_prompt` when no personality is active. Client prompt fields are ignored for
+agent behavior but still parsed and retained as protocol metadata, so request fingerprints and
+Responses chaining stay stable.
 
 ## Authentication
 
@@ -726,7 +725,7 @@ gateway:
         max_image_size_bytes: 5242880
     openwebui_compact_event: false
     responses_client_managed_session_id: true # honor X-Hermes-Session-Id on /v1/responses
-    client_managed_system_prompt: false  # true lets authenticated clients replace the managed prompt
+    client_managed_system_prompt: true  # false uses the active profile's managed prompt
     max_concurrent_runs: 10   # concurrent-run cap; 0 disables the limit
 ```
 

@@ -1515,9 +1515,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._responses_client_managed_session_id: bool = _coerce_request_bool(
             extra.get("responses_client_managed_session_id"), default=False
         )
-        # Positive opt-in: managed deployment policy remains authoritative by default.
+        # Preserve the established OpenAI-compatible API behavior by default. Deployments can
+        # explicitly disable this to make the active profile's managed prompt authoritative.
         self._client_managed_system_prompt: bool = _coerce_request_bool(
-            extra.get("client_managed_system_prompt"), default=False
+            extra.get("client_managed_system_prompt"), default=True
         )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
@@ -2915,8 +2916,9 @@ class APIServerAdapter(BasePlatformAdapter):
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
 
-        Unless ``client_managed_system_prompt`` is enabled, client ``system``
-        messages and Responses/Runs ``instructions`` are compatibility
+        By default, client ``system`` messages and Responses/Runs
+        ``instructions`` retain their established behavior. When
+        ``client_managed_system_prompt`` is disabled, they are compatibility
         metadata only and the operator-managed prompt from the active profile
         wins.
         """
@@ -3187,8 +3189,8 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             # This lookup runs while _run_agent() holds the request's profile
             # scope, so multiplexed routes resolve the managed config belonging
-            # to that profile. API clients cannot replace operator policy
-            # without the explicit opt-in.
+            # to that profile. In this explicit managed mode, API clients cannot
+            # replace it.
             effective_system_prompt = (
                 GatewayRunner._load_ephemeral_system_prompt() or ""
             ).strip()
