@@ -263,6 +263,102 @@ class TestAdapterInit:
 
         assert captured["ephemeral_system_prompt"] == expected_prompt
 
+    @pytest.mark.parametrize(
+        ("profile_config", "expected_overlay", "excluded_overlays"),
+        [
+            pytest.param(
+                "agent:\n  system_prompt: API SERVER MANAGED PROMPT\n",
+                "API SERVER MANAGED PROMPT",
+                ("CLIENT PROMPT MUST BE IGNORED",),
+                id="soul-and-system-prompt",
+            ),
+            pytest.param(
+                "display:\n"
+                "  personality: api-reviewer\n"
+                "agent:\n"
+                "  system_prompt: MANUAL PROMPT MUST BE SHADOWED\n"
+                "  personalities:\n"
+                "    api-reviewer: API SERVER PERSONALITY\n",
+                "API SERVER PERSONALITY",
+                ("CLIENT PROMPT MUST BE IGNORED", "MANUAL PROMPT MUST BE SHADOWED"),
+                id="soul-and-personality",
+            ),
+        ],
+    )
+    def test_operator_managed_policy_combines_soul_with_profile_prompt(
+        self, tmp_path, monkeypatch, profile_config, expected_overlay, excluded_overlays,
+    ):
+        """The default policy must match messaging gateways all the way to the wire prompt."""
+        from agent.turn_context import build_api_messages
+        from gateway import run as gateway_run
+        from run_agent import AIAgent as RealAgent
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "SOUL.md").write_text("API SERVER SOUL IDENTITY\n", encoding="utf-8")
+        (hermes_home / "config.yaml").write_text(profile_config, encoding="utf-8")
+
+        def create_real_agent(**kwargs):
+            kwargs["skip_memory"] = True
+            return RealAgent(**kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", create_real_agent)
+        monkeypatch.setattr(
+            gateway_run,
+            "_resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openrouter",
+                "api_key": "sk-test-api-server",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+            },
+        )
+        monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: "test/model")
+        monkeypatch.setattr(
+            gateway_run.GatewayRunner,
+            "_load_reasoning_config",
+            staticmethod(lambda model="": {}),
+        )
+        monkeypatch.setattr(
+            gateway_run.GatewayRunner,
+            "_load_fallback_model",
+            staticmethod(lambda: None),
+        )
+        monkeypatch.setattr(gateway_run, "_current_max_iterations", lambda: 90)
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+        monkeypatch.setattr("model_tools.get_tool_definitions", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr("model_tools.check_toolset_requirements", lambda *_args, **_kwargs: {})
+        monkeypatch.setattr("agent.process_bootstrap.OpenAI", MagicMock())
+
+        adapter = APIServerAdapter(PlatformConfig(
+            enabled=True,
+            extra={"client_managed_system_prompt": False},
+        ))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        with gateway_run._profile_runtime_scope(hermes_home):
+            agent = adapter._create_agent(
+                session_id="api-session",
+                ephemeral_system_prompt="CLIENT PROMPT MUST BE IGNORED",
+            )
+            base_prompt = agent._build_system_prompt()
+            api_messages, effective_prompt = build_api_messages(
+                agent,
+                [{"role": "user", "content": "hello"}],
+                current_turn_user_idx=0,
+                ext_prefetch_cache=None,
+                plugin_user_context=None,
+                moa_config=None,
+                active_system_prompt=base_prompt,
+            )
+
+        assert api_messages[0] == {"role": "system", "content": effective_prompt}
+        assert "API SERVER SOUL IDENTITY" in effective_prompt
+        assert expected_overlay in effective_prompt
+        assert effective_prompt.index("API SERVER SOUL IDENTITY") < effective_prompt.index(expected_overlay)
+        for excluded in excluded_overlays:
+            assert excluded not in effective_prompt
+
 
 # ---------------------------------------------------------------------------
 # Auth checking
