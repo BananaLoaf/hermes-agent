@@ -1138,9 +1138,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # @mssteuer.)
         self._direct_model_requests: bool = _coerce_request_bool(
             extra.get("direct_model_requests"), default=False)
-        # Positive opt-in: managed deployment policy remains authoritative by default.
+        # Preserve the established OpenAI-compatible API behavior by default. Deployments can
+        # explicitly disable this to make the active profile's managed prompt authoritative.
         self._client_managed_system_prompt: bool = _coerce_request_bool(
-            extra.get("client_managed_system_prompt"), default=False)
+            extra.get("client_managed_system_prompt"), default=True)
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -2111,9 +2112,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """Create an AIAgent from the gateway runtime config + platform toolsets.
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
-        session ``/model`` override, disables the fallback chain and fails closed. Unless
-        ``client_managed_system_prompt`` is enabled, client system messages and Responses/Runs
-        instructions are compatibility metadata only and the active profile's config wins."""
+        session ``/model`` override, disables the fallback chain and fails closed. By default,
+        client system messages and Responses/Runs instructions retain their established behavior;
+        when ``client_managed_system_prompt`` is disabled, they are compatibility metadata only
+        and the active profile's config wins."""
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
@@ -2151,7 +2153,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             effective_system_prompt = ephemeral_system_prompt or None
         else:
             # This runs inside the request profile scope, so multiplexed routes use that profile's
-            # managed prompt. API clients cannot replace operator policy without the explicit opt-in.
+            # managed prompt. In this explicit managed mode, API clients cannot replace it.
             managed_system_prompt = (GatewayRunner._load_ephemeral_system_prompt() or "").strip()
             effective_system_prompt = managed_system_prompt or None
         agent_kwargs = {

@@ -1241,12 +1241,12 @@ gateway:
   # if an agent has not unwound. Keep it below the service-manager stop budget.
   # signal_interrupt_grace_timeout: 1
 
-  # By default, API-server requests use the operator-managed prompt configured
-  # by agent.system_prompt or display.personality and ignore client `system`
-  # messages / `instructions`. Opt in only when authenticated API clients are
-  # trusted to manage the additional prompt for each request.
+  # API-server requests honor client `system` messages / `instructions` by
+  # default, preserving the established OpenAI-compatible API behavior. Set
+  # this to false to use the operator-managed display.personality or
+  # agent.system_prompt and ignore the client-provided additional prompt.
   # api_server:
-  #   client_managed_system_prompt: false
+  #   client_managed_system_prompt: true
 
   # Let platform adapters honor HTTP_PROXY / HTTPS_PROXY / NO_PROXY (and
   # SSL_CERT_FILE) from the process environment, plus macOS system-proxy

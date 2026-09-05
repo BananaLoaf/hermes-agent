@@ -159,7 +159,7 @@ class TestAdapterInit:
         assert adapter._host == "127.0.0.1"
         assert adapter._port == 8642
         assert adapter._api_key == ""
-        assert adapter._client_managed_system_prompt is False
+        assert adapter._client_managed_system_prompt is True
         assert adapter.platform == Platform.API_SERVER
 
     def test_custom_config_from_extra(self):
@@ -230,14 +230,23 @@ class TestAdapterInit:
         assert captured["checkpoint_max_file_size_mb"] == 4
 
     @pytest.mark.parametrize(
-        ("client_managed_system_prompt", "expected_prompt"),
+        ("extra", "expected_prompt"),
         [
-            pytest.param(False, "Operator-managed instruction", id="operator-managed"),
-            pytest.param(True, "Client-provided instruction", id="client-managed"),
+            pytest.param({}, "Client-provided instruction", id="default-client-managed"),
+            pytest.param(
+                {"client_managed_system_prompt": False},
+                "Operator-managed instruction",
+                id="operator-managed",
+            ),
+            pytest.param(
+                {"client_managed_system_prompt": True},
+                "Client-provided instruction",
+                id="client-managed",
+            ),
         ],
     )
     def test_create_agent_applies_configured_system_prompt_policy(
-        self, monkeypatch, client_managed_system_prompt, expected_prompt,
+        self, monkeypatch, extra, expected_prompt,
     ):
         captured = {}
 
@@ -250,10 +259,7 @@ class TestAdapterInit:
             "gateway.run.GatewayRunner._load_ephemeral_system_prompt",
             staticmethod(lambda: "  Operator-managed instruction  "),
         )
-        adapter = APIServerAdapter(PlatformConfig(
-            enabled=True,
-            extra={"client_managed_system_prompt": client_managed_system_prompt},
-        ))
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra=extra))
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
 
         adapter._create_agent(
