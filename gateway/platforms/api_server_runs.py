@@ -620,7 +620,7 @@ async def _handle_runs(
     self._run_approval_sessions[run_id] = approval_session_key
 
     event_cb = self._make_run_event_callback(run_id, loop)
-    outbound = self._new_outbound_response_processor()
+    outbound = self._new_media_response_processor()
     media_delta_queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
 
     def _put_event_if_active(event: Optional[Dict]) -> None:

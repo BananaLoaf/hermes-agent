@@ -8,6 +8,7 @@ from gateway.outbound_files.exporter import (
 )
 from gateway.outbound_files.omitted import OmittedOutboundFileProvider
 from gateway.outbound_files.provider import OutboundFileProvider
+from gateway.outbound_files.zipline import ZiplineOutboundFileProvider
 
 __all__ = [
     "Base64OutboundFileProvider",
@@ -16,5 +17,6 @@ __all__ = [
     "OutboundFileProvider",
     "OutboundFilesConfig",
     "OutboundFilesConfigError",
+    "ZiplineOutboundFileProvider",
     "create_outbound_file_provider",
 ]

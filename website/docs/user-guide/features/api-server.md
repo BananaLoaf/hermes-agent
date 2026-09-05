@@ -707,12 +707,50 @@ gateway:
     key: your-secret-key
     cors_origins: http://localhost:3000
     model_name: my-hermes
+    outbound_files:
+      provider: base64
+      provider_options:
+        max_image_size_bytes: 5242880
     openwebui_compact_event: false
     responses_client_managed_session_id: true # honor X-Hermes-Session-Id on /v1/responses
     max_concurrent_runs: 10   # concurrent-run cap; 0 disables the limit
 ```
 
-`port`, `key`, `host`, `cors_origins`, `model_name`, `openwebui_compact_event`, and `responses_client_managed_session_id` are automatically bridged into the platform's `extra` settings. Environment variables take precedence over `config.yaml` values where an environment-variable counterpart exists. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
+`port`, `key`, `host`, `cors_origins`, `model_name`, `outbound_files`, `openwebui_compact_event`, and `responses_client_managed_session_id` are automatically bridged into the platform's `extra` settings. Environment variables take precedence over `config.yaml` values where an environment-variable counterpart exists. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
+
+### Outbound media
+
+The API server intercepts `MEDIA:/absolute/path` directives in streaming and
+non-streaming Responses and Chat Completions output. Provider-specific options
+belong under `outbound_files.provider_options`.
+
+- `base64` is the default. It embeds PNG, JPEG, GIF, WebP, and BMP images up to
+  5 MiB as data URLs. Other files become `[FILE OMITTED]`.
+- `none` disables delivery. Images become `[IMAGE OMITTED]` and other files
+  become `[FILE OMITTED]` without exposing local paths. YAML `null` is accepted.
+- `zipline` uploads images and files to a Zipline server and renders the
+  returned public URL with configurable Markdown templates. Set its key as
+  `ZIPLINE_API_KEY` in `~/.hermes/.env`; an explicit `api_key` provider option
+  takes precedence when supplied.
+
+```yaml
+gateway:
+  api_server:
+    outbound_files:
+      provider: zipline
+      provider_options:
+        base_url: https://files.example.com
+        file_expiry: 7d
+        image_expiry: null
+        image_template: "![{filename}]({url})"
+        file_template: "[Download {filename}]({url})"
+        invalid_image_template: "[Image unavailable]"
+        invalid_file_template: "[File unavailable]"
+```
+
+The active provider also contributes its delivery contract to the agent's
+system instruction. If the entire `outbound_files` block is omitted, `base64`
+remains active for backward compatibility.
 
 ### Concurrent-run cap
 

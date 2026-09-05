@@ -1006,11 +1006,7 @@ PLATFORM_HINTS = {
         "You're responding through an API server whose client supports GitHub-flavored "
         "Markdown. Use headings, lists, emphasis, links, tables, blockquotes, and fenced "
         "code blocks whenever they improve the response. LaTeX math is also supported: "
-        "use $...$ for inline math and $$...$$ for display math. "
-        "File/media delivery: reference a local file with a MEDIA:/absolute/path "
-        "tag. The API server processes these tags without exposing host filesystem "
-        "paths. When external file delivery is unavailable, it replaces the tag "
-        "with a file-omitted placeholder."
+        "use $...$ for inline math and $$...$$ for display math."
     ),
     # NOTE: a "webui" hint lived here until 2026-08-29. It was a ghost
     # (verified in the all-platform hint audit, PR #97873): no code path
@@ -1023,20 +1019,6 @@ PLATFORM_HINTS = {
     # from its actual renderer — do not resurrect this text.
 }
 
-
-API_SERVER_OUTBOUND_FILES_HINT = (
-    "You're responding through an API server whose client supports GitHub-flavored "
-    "Markdown. Use headings, lists, emphasis, links, tables, blockquotes, and fenced "
-    "code blocks whenever they improve the response. LaTeX math is also supported: "
-    "use $...$ for inline math and $$...$$ for display math. "
-    "File/media delivery is enabled. To attach a generated local file, include "
-    "MEDIA:/absolute/path/to/file in your final response. The API gateway validates "
-    "the path, uploads the file through its configured outbound file provider, and "
-    "replaces the MEDIA: directive with a client-safe image or download link. Put each "
-    "MEDIA: directive on its own line; quote a path that contains spaces. Use MEDIA: "
-    "only for a file that actually exists. Do not expose raw local paths, and do not "
-    "claim that file attachments are unsupported."
-)
 
 # Telegram rich-messages extension — only injected when the user has opted in
 # to ``gateway.platforms.telegram.extra.rich_messages: true`` (or the

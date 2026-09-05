@@ -13,9 +13,7 @@ class OutboundFileProvider(ABC):
     """Turn a validated local path into client-visible response text."""
 
     @classmethod
-    def from_options(
-        cls, raw: Mapping[str, Any], *, provider_name: str
-    ) -> Self:
+    def from_options(cls, raw: Mapping[str, Any], *, provider_name: str) -> Self:
         """Parse provider-specific options from this provider's dataclass fields."""
         option_names = {item.name for item in fields(cls) if item.init}
         unknown = set(raw) - option_names
@@ -28,6 +26,10 @@ class OutboundFileProvider(ABC):
 
     def requires_valid_path(self, path: Path) -> bool:
         return True
+
+    def invalid_output(self, path: Path) -> Optional[str]:
+        """Return a safe replacement for an invalid path or provider failure."""
+        return None
 
     @abstractmethod
     async def render(self, path: Path) -> Optional[str]:

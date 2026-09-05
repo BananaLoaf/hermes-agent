@@ -42,7 +42,6 @@ from agent.prompt_builder import (
     USER_PROFILE_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
-    API_SERVER_OUTBOUND_FILES_HINT,
     PLATFORM_HINTS,
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
@@ -840,12 +839,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 _default_hint = _entry.platform_hint
         except Exception:
             pass
-
-    if (
-        platform_key == "api_server"
-        and getattr(agent, "_outbound_file_delivery_enabled", False)
-    ):
-        _default_hint = API_SERVER_OUTBOUND_FILES_HINT
 
     # For Telegram: append the rich-messages extension only when the user has
     # opted in to ``gateway.platforms.telegram.extra.rich_messages: true``

@@ -171,10 +171,12 @@ class TestAdapterInit:
                 "cors_origins": ["http://localhost:3000"],
                 "outbound_files": {
                     "provider": "zipline",
-                    "base_url": "https://files.example.com/",
-                    "api_key": "zipline-key",
-                    "file_expiry": "14d",
-                    "image_expiry": None,
+                    "provider_options": {
+                        "base_url": "https://files.example.com/",
+                        "api_key": "zipline-key",
+                        "file_expiry": "14d",
+                        "image_expiry": None,
+                    },
                 },
             },
         )
@@ -184,7 +186,7 @@ class TestAdapterInit:
         assert adapter._api_key == "sk-test"
         assert adapter._cors_origins == ("http://localhost:3000",)
         assert adapter._outbound_files.provider.base_url == "https://files.example.com"
-        assert adapter._outbound_files.config.file_expiry == "14d"
+        assert adapter._outbound_files.provider.file_expiry == "14d"
 
 
     def test_create_agent_forwards_runtime_config(self, monkeypatch):
@@ -238,18 +240,23 @@ class TestAdapterInit:
         )
 
         assert isinstance(agent, FakeAgent)
-        assert captured["ephemeral_system_prompt"] == "Operator-managed instruction"
+        assert captured["ephemeral_system_prompt"].startswith(
+            "Operator-managed instruction\n\n"
+        )
+        assert "base64" in captured["ephemeral_system_prompt"]
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
         assert captured["checkpoints_enabled"] is True
         assert captured["checkpoint_max_snapshots"] == 7
         assert captured["checkpoint_max_total_size_mb"] == 321
         assert captured["checkpoint_max_file_size_mb"] == 4
         assert captured["compaction_callback"] is compaction_callback
-        assert agent._outbound_file_delivery_enabled is False
 
-    def test_create_agent_enables_outbound_file_prompt_capability(self, monkeypatch):
+    def test_create_agent_uses_zipline_prompt_hint(self, monkeypatch):
+        captured = {}
+
         class FakeAgent:
             def __init__(self, **kwargs):
+                captured.update(kwargs)
                 self.model = kwargs.get("model")
                 self.provider = kwargs.get("provider")
 
@@ -280,17 +287,19 @@ class TestAdapterInit:
                 extra={
                     "outbound_files": {
                         "provider": "zipline",
-                        "base_url": "https://files.example.com",
-                        "api_key": "zipline-key",
+                        "provider_options": {
+                            "base_url": "https://files.example.com",
+                            "api_key": "zipline-key",
+                        },
                     },
                 },
             ),
         )
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
 
-        agent = adapter._create_agent(session_id="api-session")
+        adapter._create_agent(session_id="api-session")
 
-        assert agent._outbound_file_delivery_enabled is True
+        assert "Zipline" in captured["ephemeral_system_prompt"]
 
 
 # ---------------------------------------------------------------------------

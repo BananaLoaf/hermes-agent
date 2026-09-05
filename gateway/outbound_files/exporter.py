@@ -8,6 +8,7 @@ from gateway.outbound_files.base64 import Base64OutboundFileProvider
 from gateway.outbound_files.config import OutboundFilesConfig, OutboundFilesConfigError
 from gateway.outbound_files.omitted import OmittedOutboundFileProvider
 from gateway.outbound_files.provider import OutboundFileProvider
+from gateway.outbound_files.zipline import ZiplineOutboundFileProvider
 from gateway.platforms.base import validate_media_delivery_path
 
 logger = logging.getLogger(__name__)
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 _PROVIDER_TYPES: dict[str, type[OutboundFileProvider]] = {
     "base64": Base64OutboundFileProvider,
     "none": OmittedOutboundFileProvider,
+    "zipline": ZiplineOutboundFileProvider,
 }
 
 
@@ -50,7 +52,7 @@ class OutboundFileExporter:
         if self.provider.requires_valid_path(Path(path)):
             safe_path = validate_media_delivery_path(path)
             if not safe_path:
-                return None
+                return self.provider.invalid_output(Path(path))
             render_path = safe_path
         try:
             return await self.provider.render(Path(render_path))
@@ -60,4 +62,4 @@ class OutboundFileExporter:
                 type(self.provider).__name__,
                 type(exc).__name__,
             )
-            return None
+            return self.provider.invalid_output(Path(render_path))

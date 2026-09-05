@@ -1573,20 +1573,13 @@ class APIServerAdapter(BasePlatformAdapter):
         self._browser_control_artifacts: Dict[str, ArtifactStore] = {}
         self._browser_control_artifact_limiter: Optional[ArtifactRateLimiter] = None
 
-    def _new_outbound_response_processor(self) -> MediaResponseProcessor:
-        """Bind generic MEDIA interception to this deployment's renderer."""
-        exporter = self._outbound_files
-
-        async def replace_media(path: str) -> Optional[str]:
-            if exporter is None:
-                return "[File omitted]"
-            return await exporter.export_media_path(path)
-
-        return MediaResponseProcessor(replace_media)
+    def _new_media_response_processor(self) -> MediaResponseProcessor:
+        """Create a per-response processor with an isolated replacement cache."""
+        return MediaResponseProcessor(self._outbound_files.export_media_path)
 
     async def _render_outbound_text(self, text: str) -> str:
         """Render a complete one-shot response through the egress processor."""
-        return await self._new_outbound_response_processor().render(text)
+        return await self._new_media_response_processor().render(text)
 
     def _with_outbound_files_prompt(self, prompt: Optional[str]) -> str:
         """Append the active provider's delivery contract to managed instructions."""
@@ -3221,10 +3214,6 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
-        # Prompt assembly is lazy, so expose the adapter capability before the
-        # first model call. This keeps MEDIA: guidance truthful for API server
-        # instances that have no outbound file provider configured.
-        agent._outbound_file_delivery_enabled = self._outbound_files is not None
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -4952,7 +4941,7 @@ class APIServerAdapter(BasePlatformAdapter):
             model=body.get("model", self._model_name),
         )
         seq = 0
-        outbound = self._new_outbound_response_processor()
+        outbound = self._new_media_response_processor()
         media_delta_queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
@@ -5651,7 +5640,7 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
-        outbound = self._new_outbound_response_processor()
+        outbound = self._new_media_response_processor()
 
         try:
             last_activity = time.monotonic()
@@ -5908,7 +5897,7 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
-        outbound = self._new_outbound_response_processor()
+        outbound = self._new_media_response_processor()
 
         # State accumulated during the stream
         final_text_parts: List[str] = []

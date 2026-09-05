@@ -540,8 +540,8 @@ class TestLoadGatewayConfig:
             "    model_name: my-hermes\n"
             "    outbound_files:\n"
             "      provider: zipline\n"
-            "      base_url: https://files.example.com\n"
-            "      api_key: zipline-key\n"
+            "      provider_options:\n"
+            "        base_url: https://files.example.com\n"
             "    openwebui_compact_event: true\n"
             "    responses_client_managed_session_id: true\n",
             encoding="utf-8",
@@ -557,8 +557,9 @@ class TestLoadGatewayConfig:
         assert extra["model_name"] == "my-hermes"
         assert extra["outbound_files"] == {
             "provider": "zipline",
-            "base_url": "https://files.example.com",
-            "api_key": "zipline-key",
+            "provider_options": {
+                "base_url": "https://files.example.com",
+            },
         }
         assert extra["openwebui_compact_event"] is True
         assert extra["responses_client_managed_session_id"] is True

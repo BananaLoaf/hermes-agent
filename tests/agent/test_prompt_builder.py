@@ -665,12 +665,12 @@ class TestPromptBuilderConstants:
 
 
 
-    def test_api_server_hint_scopes_media_tag_guidance(self):
-        """The API hint describes generic MEDIA interception and its fallback."""
+    def test_api_server_hint_is_provider_agnostic(self):
+        """Provider-specific media guidance is injected by the API adapter."""
         hint = PLATFORM_HINTS["api_server"]
-        assert "MEDIA:" in hint
-        assert "without exposing host filesystem paths" in hint
-        assert "file-omitted placeholder" in hint
+        assert "GitHub-flavored Markdown" in hint
+        assert "MEDIA:" not in hint
+        assert "base64" not in hint
 
     def test_markdown_converting_platform_hints_do_not_forbid_markdown(self):
         """#12224 — WhatsApp (Baileys) and Signal adapters actively convert

@@ -26,7 +26,9 @@ class OutboundFilesConfig:
         unknown = set(raw) - {"provider", "provider_options"}
         if unknown:
             names = ", ".join(sorted(str(key) for key in unknown))
-            raise OutboundFilesConfigError(f"unsupported outbound_files options: {names}")
+            raise OutboundFilesConfigError(
+                f"unsupported outbound_files options: {names}"
+            )
         provider = raw.get("provider", "base64")
         if provider is None:
             provider = "none"

@@ -18,7 +18,6 @@ from unittest.mock import patch
 import pytest
 
 from agent.prompt_builder import (
-    API_SERVER_OUTBOUND_FILES_HINT,
     PLATFORM_HINTS,
     build_environment_hints,
 )
@@ -75,25 +74,14 @@ class TestDesktopHintEntry:
         assert "markdown" in hint.lower()
 
 
-class TestAPIServerOutboundFilesHint:
-    def test_enabled_capability_replaces_legacy_partial_media_hint(self):
-        stable = _stable_prompt(
-            _make_agent(
-                platform="api_server",
-                _outbound_file_delivery_enabled=True,
-            )
-        )
-
-        assert API_SERVER_OUTBOUND_FILES_HINT in stable
-        assert "Non-image files are NOT intercepted" not in stable
-        assert "GitHub-flavored Markdown" in stable
-        assert "LaTeX math" in stable
-
-    def test_disabled_capability_keeps_legacy_partial_media_hint(self):
+class TestAPIServerHint:
+    def test_platform_hint_is_provider_agnostic(self):
         stable = _stable_prompt(_make_agent(platform="api_server"))
 
         assert PLATFORM_HINTS["api_server"] in stable
-        assert API_SERVER_OUTBOUND_FILES_HINT not in stable
+        assert "GitHub-flavored Markdown" in stable
+        assert "LaTeX math" in stable
+        assert "MEDIA:" not in stable
 
 
 
