@@ -411,8 +411,10 @@ class OpenAICompatRoutesMixin:
         from gateway.platforms.api_server import (
             ThreadSafeAsyncQueue, _chat_usage_payload, _coerce_request_bool,
             _content_has_visible_payload, _derive_chat_session_id, _error_response, _invalid_request,
-            _multimodal_validation_error, _normalize_chat_content, _normalize_multimodal_content,
+            _multimodal_validation_error, _normalize_chat_content,
+            _normalize_request_multimodal_content,
             _openai_error, _redact_api_error_text, _resolve_media_to_data_urls)
+        from gateway.platforms.api_server_files import validate_file_part_limit
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:
@@ -425,6 +427,12 @@ class OpenAICompatRoutesMixin:
         if not messages or not isinstance(messages, list):
             return _invalid_request("Missing or invalid 'messages' field")
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        try:
+            validate_file_part_limit(
+                [msg.get("content") for msg in messages if isinstance(msg, dict)]
+            )
+        except ValueError as exc:
+            return _multimodal_validation_error(exc, param="messages")
 
         # System messages -> ephemeral system prompt layered ON TOP of core, flattened to text
         # (Anthropic rejects images there, OpenAI text models ignore them).
@@ -438,7 +446,7 @@ class OpenAICompatRoutesMixin:
                 system_prompt = content if system_prompt is None else system_prompt + "\n" + content
             elif role in {"user", "assistant"}:
                 try:
-                    content = _normalize_multimodal_content(raw_content)
+                    content = await _normalize_request_multimodal_content(raw_content)
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
                 conversation_messages.append({"role": role, "content": content})
@@ -732,8 +740,9 @@ class OpenAICompatRoutesMixin:
         from gateway.platforms.api_server import (
             ThreadSafeAsyncQueue, _auto_truncate_response_history, _coerce_request_bool,
             _content_has_visible_payload, _error_response, _invalid_request,
-            _multimodal_validation_error, _normalize_multimodal_content, _redact_api_error_text,
+            _multimodal_validation_error, _normalize_request_multimodal_content, _redact_api_error_text,
             _resolve_media_to_data_urls, _responses_usage_payload)
+        from gateway.platforms.api_server_files import validate_file_part_limit
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:
@@ -758,6 +767,21 @@ class OpenAICompatRoutesMixin:
             # A conversation name resolves to its latest response_id (unknown = new conversation).
             previous_response_id = self._response_store.get_conversation(conversation)
 
+        raw_history = body.get("conversation_history")
+        request_contents = (
+            [item.get("content") for item in raw_input if isinstance(item, dict)]
+            if isinstance(raw_input, list)
+            else []
+        )
+        if isinstance(raw_history, list):
+            request_contents.extend(
+                entry.get("content") for entry in raw_history if isinstance(entry, dict)
+            )
+        try:
+            validate_file_part_limit(request_contents)
+        except ValueError as exc:
+            return _multimodal_validation_error(exc, param="input")
+
         input_messages: List[Dict[str, Any]] = []
         if isinstance(raw_input, str):
             input_messages = [{"role": "user", "content": raw_input}]
@@ -767,7 +791,7 @@ class OpenAICompatRoutesMixin:
                     input_messages.append({"role": "user", "content": item})
                 elif isinstance(item, dict):
                     try:
-                        content = _normalize_multimodal_content(item.get("content", ""))
+                        content = await _normalize_request_multimodal_content(item.get("content", ""))
                     except ValueError as exc:
                         return _multimodal_validation_error(exc, param=f"input[{idx}].content")
                     input_messages.append({"role": item.get("role", "user"), "content": content})
@@ -776,7 +800,6 @@ class OpenAICompatRoutesMixin:
 
         # Explicit conversation_history (stateless clients) beats previous_response_id chaining.
         conversation_history: List[Dict[str, Any]] = []
-        raw_history = body.get("conversation_history")
         if raw_history:
             if not isinstance(raw_history, list):
                 return _error_response("'conversation_history' must be an array of message objects", 400)
@@ -784,7 +807,7 @@ class OpenAICompatRoutesMixin:
                 if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
                     return _error_response(f"conversation_history[{i}] must have 'role' and 'content' fields", 400)
                 try:
-                    entry_content = _normalize_multimodal_content(entry["content"])
+                    entry_content = await _normalize_request_multimodal_content(entry["content"])
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
                 conversation_history.append({"role": str(entry["role"]), "content": entry_content})

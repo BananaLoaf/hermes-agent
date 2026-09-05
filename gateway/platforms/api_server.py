@@ -1,6 +1,6 @@
 """OpenAI-compatible API server platform adapter (aiohttp).
 
-Serves /v1/chat/completions, /v1/responses, /v1/models, /v1/capabilities, /api/sessions,
+Serves /v1/chat/completions, /v1/responses, /v1/files, /v1/models, /v1/capabilities, /api/sessions,
 /v1/runs, /api/jobs and /health* (full table: ``APIServerAdapter._http_route_table``); any
 OpenAI-compatible frontend connects at http://localhost:8642/v1 with API_SERVER_KEY. Under
 ``gateway.multiplex_profiles`` secondary profiles live at ``/p/<profile>/...``.
@@ -70,13 +70,16 @@ _STATIC_FEATURE_FLAGS = {
     "session_resources": True, "model_options": True, "session_chat": True,
     "session_chat_streaming": True, "session_fork": True, "session_model_lock": True,
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
-    "skills_api": True, "audio_api": False, "realtime_voice": False,
+    "skills_api": True, "files_api": True, "audio_api": False, "realtime_voice": False,
     "session_continuity_header": "X-Hermes-Session-Id",
     "session_key_header": "X-Hermes-Session-Key"}
 # /v1/capabilities "endpoints" table: name -> (method, path).
 _CAPABILITY_ENDPOINTS = (
     ("health", ("GET", "/health")), ("health_detailed", ("GET", "/health/detailed")),
     ("models", ("GET", "/v1/models")), ("model_options", ("GET", "/api/model/options")),
+    ("files", ("POST", "/v1/files")), ("files_list", ("GET", "/v1/files")),
+    ("file", ("GET", "/v1/files/{file_id}")),
+    ("file_content", ("GET", "/v1/files/{file_id}/content")),
     ("chat_completions", ("POST", "/v1/chat/completions")),
     ("responses", ("POST", "/v1/responses")), ("runs", ("POST", "/v1/runs")),
     ("run_status", ("GET", "/v1/runs/{run_id}")),
@@ -119,6 +122,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms.api_server_files import OpenAIFilesRoutesMixin, materialize_file_part
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, is_network_accessible, validate_media_delivery_path)
@@ -199,7 +203,8 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+# Accommodates a 20 MiB Files API upload or its base64 ``input_file.file_data`` form.
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -487,10 +492,9 @@ def _normalize_image_part(part: Dict[str, Any]) -> Dict[str, Any]:
 
 def _normalize_multimodal_content(content: Any) -> Any:
     """Validate multimodal content: a plain string when text-only, else canonical ``text`` /
-    ``image_url`` parts (native OpenAI vision shape; Anthropic conversion happens downstream).
+    ``image_url`` parts or cached-file notes.
 
-    Raises ``ValueError("<code>:<message>")`` with codes ``unsupported_content_type`` (file
-    parts, non-image data URLs, unknown types), ``invalid_image_url``, ``invalid_content_part``.
+    Raises ``ValueError("<code>:<message>")`` with an OpenAI-compatible error code.
     """
     if content is None:
         return ""
@@ -498,6 +502,9 @@ def _normalize_multimodal_content(content: Any) -> Any:
         return _cap_text(content)
     if not isinstance(content, list):
         return _normalize_chat_content(content)
+    from gateway.platforms.api_server_files import validate_file_part_limit
+
+    validate_file_part_limit([content])
     normalized_parts: List[Dict[str, Any]] = []
     for part in _cap_list(content):
         if isinstance(part, str):
@@ -515,13 +522,11 @@ def _normalize_multimodal_content(content: Any) -> Any:
         elif part_type in _IMAGE_PART_TYPES:
             normalized_parts.append(_normalize_image_part(part))
         elif part_type in _FILE_PART_TYPES:
-            raise ValueError(
-                "unsupported_content_type:Inline image inputs are supported, "
-                "but uploaded files and document inputs are not supported on this endpoint.")
+            normalized_parts.append(materialize_file_part(part))
         else:
             raise ValueError(
                 f"unsupported_content_type:Unsupported content part type {raw_type!r}. "
-                "Only text and image_url/input_image parts are supported.")
+                "Only text, image_url/input_image, and file/input_file parts are supported.")
     if not normalized_parts:
         return ""
     # Text-only collapses to a plain string so trajectory logging and prompt caching see
@@ -532,17 +537,26 @@ def _normalize_multimodal_content(content: Any) -> Any:
 
 
 def _content_has_visible_payload(content: Any) -> bool:
-    """True when content has any text or image attachment.  Used to reject empty turns."""
+    """True when content has any text or attachment. Used to reject empty turns."""
     if isinstance(content, str):
         return bool(content.strip())
     if isinstance(content, list):
         for part in content:
             if isinstance(part, dict):
                 ptype = str(part.get("type") or "").strip().lower()
-                if ptype in _IMAGE_PART_TYPES or (
+                if ptype in _IMAGE_PART_TYPES or ptype in _FILE_PART_TYPES or (
                         ptype in _TEXT_PART_TYPES and str(part.get("text") or "").strip()):
                     return True
     return False
+
+
+async def _normalize_request_multimodal_content(content: Any) -> Any:
+    """Normalize without decoding, reading or caching file bytes on the aiohttp loop."""
+    from gateway.platforms.api_server_files import contains_file_part
+
+    if contains_file_part(content):
+        return await asyncio.to_thread(_normalize_multimodal_content, content)
+    return _normalize_multimodal_content(content)
 
 
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
@@ -620,13 +634,15 @@ def _clear_turn_process_ownership(agent: Any) -> None:
     agent._gateway_turn_process_epoch = None
 
 
-def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") -> tuple[Any, Optional["web.Response"]]:
+async def _session_chat_user_message(
+    body: Dict[str, Any], *, param: str = "message"
+) -> tuple[Any, Optional["web.Response"]]:
     """Parse and normalize session chat ``message`` / ``input`` like chat completions."""
     user_message = body.get("message") or body.get("input")
     if not _content_has_visible_payload(user_message):
         return None, _error_response("Missing 'message' field", 400, code="missing_message")
     try:
-        return _normalize_multimodal_content(user_message), None
+        return await _normalize_request_multimodal_content(user_message), None
     except ValueError as exc:
         return None, _multimodal_validation_error(exc, param=param)
 
@@ -1099,7 +1115,7 @@ def _run_route_delegate(name: str):
     return _handler
 
 
-class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+class APIServerAdapter(OpenAICompatRoutesMixin, OpenAIFilesRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
     # Stateless request/response (``send()`` is a stub): async-delivery tools must not promise
@@ -1512,6 +1528,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/health/detailed", self._handle_health_detailed),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
+            ("GET", "/v1/files", self._handle_list_files),
+            ("POST", "/v1/files", self._handle_create_file),
+            ("GET", "/v1/files/{file_id}", self._handle_get_file),
+            ("GET", "/v1/files/{file_id}/content", self._handle_get_file_content),
+            ("DELETE", "/v1/files/{file_id}", self._handle_delete_file),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             # Browser-control (gated on browser.extension_control.enabled + API key): POST
@@ -2993,7 +3014,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return None, err
-        user_message, err = _session_chat_user_message(body)
+        user_message, err = await _session_chat_user_message(body)
         if err is not None:
             return None, err
         system_prompt = body.get("system_message") or body.get("instructions")

@@ -104,13 +104,32 @@ Standard OpenAI Chat Completions format. Stateless — the full conversation is 
 }
 ```
 
-Uploaded files (`file` / `input_file` / `file_id`) and non-image `data:` URLs return `400 unsupported_content_type`.
+File parts may use a `file_id` returned by the Files API below, or a base64
+`file_data` value for compatibility.
 
 **Streaming** (`"stream": true`): Returns Server-Sent Events (SSE) with token-by-token response chunks. For **Chat Completions**, the stream uses standard `chat.completion.chunk` events plus Hermes' custom `hermes.tool.progress` event for tool-start UX. For **Responses**, the stream uses OpenAI Responses event types such as `response.created`, `response.output_text.delta`, `response.output_item.added`, `response.output_item.done`, and `response.completed`.
 
 **Tool progress in streams**:
 - **Chat Completions**: Hermes emits `event: hermes.tool.progress` for tool-start visibility without polluting persisted assistant text.
 - **Responses**: Hermes emits spec-native `function_call` and `function_call_output` output items during the SSE stream, so clients can render structured tool UI in real time.
+
+### Files API
+
+Upload one file as `multipart/form-data`, then reference the returned `file_id`
+from a Chat Completions `file` part or a Responses `input_file` part:
+
+```bash
+curl http://localhost:8642/v1/files \
+  -H "Authorization: Bearer $API_SERVER_KEY" \
+  -F purpose=user_data \
+  -F file=@report.pdf
+```
+
+`GET /v1/files`, `GET /v1/files/{file_id}`,
+`GET /v1/files/{file_id}/content`, and `DELETE /v1/files/{file_id}` are also
+supported. Uploaded bytes use the active profile's regular
+`cache/documents` storage, exactly like documents received through Telegram;
+file IDs and metadata remain profile-local under multiplexing.
 
 ### POST /v1/responses
 
@@ -161,7 +180,9 @@ Tool calls in the `output` array were already executed server-side by the Hermes
 }
 ```
 
-Uploaded files (`input_file` / `file_id`) and non-image `data:` URLs return `400 unsupported_content_type`.
+`input_file` accepts either a Files API `file_id` or base64 `file_data`. Small
+UTF-8 text files are included in the turn; other documents are exposed to the
+agent through their profile-local cached path.
 
 #### Multi-turn with previous_response_id
 
@@ -759,7 +780,8 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 ## Limitations
 
 - **Response storage** — stored responses (for `previous_response_id`) are persisted in SQLite and survive gateway restarts. Max 100 stored responses (LRU eviction).
-- **No file upload** — inline images are supported on both `/v1/chat/completions` and `/v1/responses`, but uploaded files (`file`, `input_file`, `file_id`) and non-image document inputs are not supported through the API.
+- **File limits** — each upload and inline file is limited to 20 MiB, with at
+  most 10 file parts per model request.
 - **Simple OpenAI clients still see an alias** — `/v1/models` advertises the
   stable Hermes alias (`hermes-agent` or the active profile name). Richer
   clients can send explicit `provider` / `model_options` overrides on requests.

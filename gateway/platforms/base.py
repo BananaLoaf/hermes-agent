@@ -1178,6 +1178,33 @@ _TEXT_INJECT_EXTENSIONS = {
     ".dockerfile", ".makefile", ".cmake", ".gradle", ".rst", ".tex", ".srt", ".vtt", ".diff",
     ".patch"}
 
+MAX_TEXT_DOCUMENT_INLINE_BYTES = 100 * 1024
+
+
+def inline_text_document_content(
+    data: bytes,
+    *,
+    filename: str,
+    mime_type: str = "",
+    max_bytes: int = MAX_TEXT_DOCUMENT_INLINE_BYTES,
+) -> Optional[str]:
+    """Return the gateway's small UTF-8 document block, or ``None`` for binary/large data.
+
+    Extension/MIME gating is intentional: PDF, ZIP and Office files can begin with valid
+    UTF-8 bytes but must still be handled as binary documents by the agent.
+    """
+    ext = os.path.splitext(filename or "")[1].lower()
+    if len(data) > max_bytes or not (
+        ext in _TEXT_INJECT_EXTENSIONS or (mime_type or "").lower().startswith("text/")
+    ):
+        return None
+    try:
+        text_content = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    display_name = re.sub(r"[^\w.\- ]", "_", filename or f"document{ext or '.txt'}")
+    return f"[Content of {display_name}]:\n{text_content}"
+
 # Image exts platforms may deliver as "documents" (file-picker uploads); routed to the image cache.
 SUPPORTED_IMAGE_DOCUMENT_TYPES = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
