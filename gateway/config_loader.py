@@ -126,8 +126,8 @@ def merge_platform_sections(yaml_cfg: dict, gateway_cfg: Any, gw_data: dict) -> 
     ``gateway.platforms.*`` → top-level ``platforms.*`` → ``gateway.<platform>`` subsections (nested
     first so top-level config keeps precedence, matching the gateway.streaming fallback). An
     ``enabled`` key in any block sets the ``_enabled_explicit`` marker consumed by the env pass.
-    Finally api_server's port/key/host/cors_origins/model_name are bridged into ``extra`` so
-    ``gateway.api_server.port: 8642`` reaches the adapter (mirrors the env path).
+    Finally api_server's adapter-owned settings are bridged into ``extra`` so values such as
+    ``gateway.api_server.port: 8642`` reach the adapter (mirrors the env path).
     """
     platforms_data = _dict_slot(gw_data, "platforms")
 
@@ -155,7 +155,10 @@ def merge_platform_sections(yaml_cfg: dict, gateway_cfg: Any, gw_data: dict) -> 
     api_plat = platforms_data.get("api_server")
     if isinstance(api_plat, dict):
         api_extra = _dict_slot(api_plat, "extra")
-        for key in ("port", "key", "host", "cors_origins", "model_name"):
+        for key in (
+            "port", "key", "host", "cors_origins", "model_name",
+            "client_managed_system_prompt",
+        ):
             if key in api_plat and key not in api_extra:
                 api_extra[key] = api_plat.pop(key)
     return platforms_data
@@ -213,12 +216,12 @@ _SHARED_KEYS: tuple = (
     *_plain("gateway_restart_notification", "typing_indicator", "typing_status_text"),
 )
 
-# Top-level port/host/secret bridged into ``extra`` for adapters that read them from config.extra
-# (PlatformConfig.from_dict only reads the ``extra:`` sub-key, so ``platforms.webhook.port`` would be lost).
+# Adapter-owned settings bridged into ``extra`` (PlatformConfig.from_dict only reads the
+# ``extra:`` sub-key, so settings such as ``platforms.webhook.port`` would otherwise be lost).
 _PORT_BRIDGE_KEYS: dict = {
     Platform.WEBHOOK: ("port", "host", "secret"),
     Platform.MSGRAPH_WEBHOOK: ("port", "host", "secret"),
-    Platform.API_SERVER: ("port", "host"),
+    Platform.API_SERVER: ("port", "host", "client_managed_system_prompt"),
 }
 
 

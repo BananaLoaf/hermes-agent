@@ -8,7 +8,7 @@ Tests cover:
 - Auth (valid key, invalid key, no key configured)
 - /v1/models endpoint
 - /health endpoint
-- System prompt extraction
+- System prompt parsing and managed enforcement
 - Error handling (invalid JSON, missing fields)
 """
 
@@ -159,6 +159,7 @@ class TestAdapterInit:
         assert adapter._host == "127.0.0.1"
         assert adapter._port == 8642
         assert adapter._api_key == ""
+        assert adapter._client_managed_system_prompt is False
         assert adapter.platform == Platform.API_SERVER
 
     def test_custom_config_from_extra(self):
@@ -169,6 +170,7 @@ class TestAdapterInit:
                 "port": 9999,
                 "key": "sk-test",
                 "cors_origins": ["http://localhost:3000"],
+                "client_managed_system_prompt": True,
             },
         )
         adapter = APIServerAdapter(config)
@@ -176,6 +178,7 @@ class TestAdapterInit:
         assert adapter._port == 9999
         assert adapter._api_key == "sk-test"
         assert adapter._cors_origins == ("http://localhost:3000",)
+        assert adapter._client_managed_system_prompt is True
 
 
     def test_create_agent_forwards_runtime_config(self, monkeypatch):
@@ -225,6 +228,40 @@ class TestAdapterInit:
         assert captured["checkpoint_max_snapshots"] == 7
         assert captured["checkpoint_max_total_size_mb"] == 321
         assert captured["checkpoint_max_file_size_mb"] == 4
+
+    @pytest.mark.parametrize(
+        ("client_managed_system_prompt", "expected_prompt"),
+        [
+            pytest.param(False, "Operator-managed instruction", id="operator-managed"),
+            pytest.param(True, "Client-provided instruction", id="client-managed"),
+        ],
+    )
+    def test_create_agent_applies_configured_system_prompt_policy(
+        self, monkeypatch, client_managed_system_prompt, expected_prompt,
+    ):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_ephemeral_system_prompt",
+            staticmethod(lambda: "  Operator-managed instruction  "),
+        )
+        adapter = APIServerAdapter(PlatformConfig(
+            enabled=True,
+            extra={"client_managed_system_prompt": client_managed_system_prompt},
+        ))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        adapter._create_agent(
+            session_id="api-session",
+            ephemeral_system_prompt="Client-provided instruction",
+        )
+
+        assert captured["ephemeral_system_prompt"] == expected_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -2488,6 +2525,9 @@ def _patch_create_agent_runtime(monkeypatch, captured: dict, fake_agent_cls):
     monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
     monkeypatch.setattr(
         "gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda model="": {})
+    )
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_ephemeral_system_prompt", staticmethod(lambda: "")
     )
     monkeypatch.setattr(
         "gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None)

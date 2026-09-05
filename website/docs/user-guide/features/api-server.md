@@ -121,7 +121,6 @@ OpenAI Responses API format. Supports server-side conversation state via `previo
 {
   "model": "hermes-agent",
   "input": "What files are in my project?",
-  "instructions": "You are a helpful coding assistant.",
   "store": true
 }
 ```
@@ -600,11 +599,24 @@ Rules: max 256 chars, control characters (`\r`, `\n`, `\x00`) are rejected, and 
 
 ## System Prompt Handling
 
-When a frontend sends a `system` message (Chat Completions) or `instructions` field (Responses API), hermes-agent **layers it on top** of its core system prompt. Your agent keeps all its tools, memory, and skills — the frontend's system prompt adds extra instructions.
+By default, the API server ignores client-provided `system` messages (Chat Completions) and
+`instructions` fields (Responses and Runs). It uses the operator-managed prompt from the active
+profile's `display.personality` or `agent.system_prompt`, layered on top of the Hermes core prompt.
+This keeps deployment policy authoritative across OpenAI-compatible clients and multiplexed
+profile routes.
 
-This means you can customize behavior per-frontend without losing capabilities:
-- Open WebUI system prompt: "You are a Python expert. Always include type hints."
-- The agent still has terminal, file tools, web search, memory, etc.
+To let authenticated clients manage this additional prompt instead, enable the explicit opt-in:
+
+```yaml
+gateway:
+  api_server:
+    client_managed_system_prompt: true
+```
+
+When enabled, Chat Completions `system` messages and Responses/Runs `instructions` replace the
+operator-managed additional prompt for that request. The Hermes core prompt, profile SOUL, tools,
+memory, and skills remain intact. Client prompt fields are still parsed and retained as protocol
+metadata when the option is disabled, so request fingerprints and Responses chaining stay stable.
 
 ## Authentication
 
@@ -671,10 +683,14 @@ gateway:
     key: your-secret-key
     cors_origins: http://localhost:3000
     model_name: my-hermes
+    client_managed_system_prompt: false  # true lets authenticated clients replace the managed prompt
     max_concurrent_runs: 10   # concurrent-run cap; 0 disables the limit
 ```
 
-`port`, `key`, `host`, `cors_origins`, and `model_name` are automatically bridged into the platform's `extra` settings, so they behave exactly like their `API_SERVER_*` environment-variable counterparts. Environment variables take precedence over `config.yaml` values. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
+The adapter-specific settings are automatically bridged into the platform's `extra` settings.
+Environment variables take precedence over `config.yaml` where an equivalent `API_SERVER_*`
+variable exists. The block is also accepted under `gateway.platforms.api_server:` or a top-level
+`platforms.api_server:` section.
 
 ### Concurrent-run cap
 
