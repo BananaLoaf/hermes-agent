@@ -4,6 +4,9 @@ OpenAI-compatible API server platform adapter.
 Exposes an HTTP server with endpoints:
 - POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; optional client-managed identity via X-Hermes-Session-Id; X-Hermes-Session-Key and opt-in X-Hermes-Events supported)
+- GET/POST /v1/files               — list and upload profile-local input files
+- GET/DELETE /v1/files/{file_id}   — inspect or delete an uploaded file
+- GET /v1/files/{file_id}/content  — download uploaded file bytes
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
@@ -141,6 +144,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms.api_server_files import OpenAIFilesRoutesMixin, materialize_file_part
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -265,7 +269,8 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+# Accommodates a 20 MiB Files API upload or its base64 ``input_file.file_data`` form.
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -692,14 +697,13 @@ def _normalize_multimodal_content(content: Any) -> Any:
     """Validate and normalize multimodal content for the API server.
 
     Returns a plain string when the content is text-only, or a list of
-    ``{"type": "text"|"image_url", ...}`` parts when images are present.
+    canonical image parts and cached-file notes when attachments are present.
     The output shape is the native OpenAI Chat Completions vision format,
     which the agent pipeline accepts verbatim (OpenAI-wire providers) or
     converts (``_preprocess_anthropic_content`` for Anthropic).
 
     Raises ``ValueError`` with an OpenAI-style code on invalid input:
-      * ``unsupported_content_type`` — file/input_file/file_id parts, or
-        non-image ``data:`` URLs.
+      * ``unsupported_content_type`` — unknown parts or non-image ``data:`` URLs.
       * ``invalid_image_url`` — missing URL or unsupported scheme.
       * ``invalid_content_part`` — malformed text/image objects.
 
@@ -716,6 +720,9 @@ def _normalize_multimodal_content(content: Any) -> Any:
         return _normalize_chat_content(content)
 
     items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
+    from gateway.platforms.api_server_files import validate_file_part_limit
+
+    validate_file_part_limit([items])
     normalized_parts: List[Dict[str, Any]] = []
     text_accum_len = 0
 
@@ -782,16 +789,14 @@ def _normalize_multimodal_content(content: Any) -> Any:
             continue
 
         if part_type in _FILE_PART_TYPES:
-            raise ValueError(
-                "unsupported_content_type:Inline image inputs are supported, "
-                "but uploaded files and document inputs are not supported on this endpoint."
-            )
+            normalized_parts.append(materialize_file_part(part))
+            continue
 
         # Unknown part type — reject explicitly so clients get a clear error
         # instead of a silently dropped turn.
         raise ValueError(
             f"unsupported_content_type:Unsupported content part type {raw_type!r}. "
-            "Only text and image_url/input_image parts are supported."
+            "Only text, image_url/input_image, and file/input_file parts are supported."
         )
 
     if not normalized_parts:
@@ -807,7 +812,7 @@ def _normalize_multimodal_content(content: Any) -> Any:
 
 
 def _content_has_visible_payload(content: Any) -> bool:
-    """True when content has any text or image attachment.  Used to reject empty turns."""
+    """True when content has any text or attachment. Used to reject empty turns."""
     if isinstance(content, str):
         return bool(content.strip())
     if isinstance(content, list):
@@ -816,9 +821,18 @@ def _content_has_visible_payload(content: Any) -> bool:
                 ptype = str(part.get("type") or "").strip().lower()
                 if ptype in _TEXT_PART_TYPES and str(part.get("text") or "").strip():
                     return True
-                if ptype in _IMAGE_PART_TYPES:
+                if ptype in _IMAGE_PART_TYPES or ptype in _FILE_PART_TYPES:
                     return True
     return False
+
+
+async def _normalize_request_multimodal_content(content: Any) -> Any:
+    """Normalize without decoding, reading or caching file bytes on the aiohttp loop."""
+    from gateway.platforms.api_server_files import contains_file_part
+
+    if contains_file_part(content):
+        return await asyncio.to_thread(_normalize_multimodal_content, content)
+    return _normalize_multimodal_content(content)
 
 
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
@@ -935,7 +949,9 @@ def _clear_turn_process_ownership(agent: Any) -> None:
     agent._gateway_turn_process_epoch = None
 
 
-def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") -> tuple[Any, Optional["web.Response"]]:
+async def _session_chat_user_message(
+    body: Dict[str, Any], *, param: str = "message"
+) -> tuple[Any, Optional["web.Response"]]:
     """Parse and normalize session chat ``message`` / ``input`` like chat completions."""
     user_message = body.get("message") or body.get("input")
     if not _content_has_visible_payload(user_message):
@@ -944,7 +960,7 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
             status=400,
         )
     try:
-        return _normalize_multimodal_content(user_message), None
+        return await _normalize_request_multimodal_content(user_message), None
     except ValueError as exc:
         return None, _multimodal_validation_error(exc, param=param)
 
@@ -1436,7 +1452,7 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
-class APIServerAdapter(BasePlatformAdapter):
+class APIServerAdapter(OpenAIFilesRoutesMixin, BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
 
@@ -2225,6 +2241,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/health/detailed", self._handle_health_detailed),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
+            ("GET", "/v1/files", self._handle_list_files),
+            ("POST", "/v1/files", self._handle_create_file),
+            ("GET", "/v1/files/{file_id}", self._handle_get_file),
+            ("GET", "/v1/files/{file_id}/content", self._handle_get_file_content),
+            ("DELETE", "/v1/files/{file_id}", self._handle_delete_file),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             # Authenticated browser-control surface: POST registration
@@ -3450,6 +3471,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
+                "files_api": True,
                 "audio_api": False,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
@@ -3491,6 +3513,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
                 "model_options": {"method": "GET", "path": "/api/model/options"},
+                "files": {"method": "POST", "path": "/v1/files"},
+                "files_list": {"method": "GET", "path": "/v1/files"},
+                "file": {"method": "GET", "path": "/v1/files/{file_id}"},
+                "file_content": {
+                    "method": "GET",
+                    "path": "/v1/files/{file_id}/content",
+                },
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
@@ -4761,7 +4790,7 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        user_message, err = _session_chat_user_message(body)
+        user_message, err = await _session_chat_user_message(body)
         if err is not None:
             return err
         system_prompt = body.get("system_message") or body.get("instructions")
@@ -4882,7 +4911,7 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        user_message, err = _session_chat_user_message(body)
+        user_message, err = await _session_chat_user_message(body)
         if err is not None:
             return err
         system_prompt = body.get("system_message") or body.get("instructions")
@@ -5274,6 +5303,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        from gateway.platforms.api_server_files import validate_file_part_limit
+
+        try:
+            validate_file_part_limit(
+                [message.get("content") for message in messages if isinstance(message, dict)]
+            )
+        except ValueError as exc:
+            return _multimodal_validation_error(exc, param="messages")
+
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
         # Parse client system text for OpenAI request compatibility and the
@@ -5295,7 +5333,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     system_prompt = system_prompt + "\n" + content
             elif role in {"user", "assistant"}:
                 try:
-                    content = _normalize_multimodal_content(raw_content)
+                    content = await _normalize_request_multimodal_content(raw_content)
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
                 conversation_messages.append({"role": role, "content": content})
@@ -6575,6 +6613,23 @@ class APIServerAdapter(BasePlatformAdapter):
             previous_response_id = self._response_store.get_conversation(conversation)
             # No error if conversation doesn't exist yet — it's a new conversation
 
+        raw_history = body.get("conversation_history")
+        request_contents = (
+            [item.get("content") for item in raw_input if isinstance(item, dict)]
+            if isinstance(raw_input, list)
+            else []
+        )
+        if isinstance(raw_history, list):
+            request_contents.extend(
+                entry.get("content") for entry in raw_history if isinstance(entry, dict)
+            )
+        from gateway.platforms.api_server_files import validate_file_part_limit
+
+        try:
+            validate_file_part_limit(request_contents)
+        except ValueError as exc:
+            return _multimodal_validation_error(exc, param="input")
+
         # Normalize input to message list
         input_messages: List[Dict[str, Any]] = []
         if isinstance(raw_input, str):
@@ -6586,7 +6641,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 elif isinstance(item, dict):
                     role = item.get("role", "user")
                     try:
-                        content = _normalize_multimodal_content(item.get("content", ""))
+                        content = await _normalize_request_multimodal_content(item.get("content", ""))
                     except ValueError as exc:
                         return _multimodal_validation_error(exc, param=f"input[{idx}].content")
                     input_messages.append({"role": role, "content": content})
@@ -6597,7 +6652,6 @@ class APIServerAdapter(BasePlatformAdapter):
         # stateless clients separate prior messages from the current input.
         # Precedence: explicit conversation_history > previous_response_id.
         conversation_history: List[Dict[str, Any]] = []
-        raw_history = body.get("conversation_history")
         if raw_history:
             if not isinstance(raw_history, list):
                 return web.json_response(
@@ -6619,7 +6673,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         status=400,
                     )
                 try:
-                    entry_content = _normalize_multimodal_content(entry["content"])
+                    entry_content = await _normalize_request_multimodal_content(entry["content"])
                 except ValueError as exc:
                     return _multimodal_validation_error(
                         exc, param=f"conversation_history[{i}].content"
