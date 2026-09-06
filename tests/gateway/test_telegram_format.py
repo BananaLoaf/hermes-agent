@@ -469,6 +469,99 @@ async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
 
 class TestEditMessageStreamingSafety:
 
+    @staticmethod
+    def _assert_link_previews_disabled(kwargs):
+        legacy_disabled = kwargs.get("disable_web_page_preview") is True
+        options_supplied = kwargs.get("link_preview_options") is not None
+        assert legacy_disabled or options_supplied
+
+    @pytest.mark.asyncio
+    async def test_edits_apply_disabled_link_preview_policy(self):
+        adapter = TelegramAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="fake-token",
+                extra={"disable_link_previews": True},
+            )
+        )
+        adapter._bot = MagicMock()
+        adapter._bot.edit_message_text = AsyncMock()
+
+        result = await adapter.edit_message(
+            "123", "456", "https://example.com", finalize=False
+        )
+
+        assert result.success is True
+        self._assert_link_previews_disabled(
+            adapter._bot.edit_message_text.call_args.kwargs
+        )
+
+    @pytest.mark.asyncio
+    async def test_plain_fallback_keeps_disabled_link_preview_policy(self):
+        adapter = TelegramAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="fake-token",
+                extra={"disable_link_previews": True},
+            )
+        )
+        adapter._bot = MagicMock()
+        adapter._bot.edit_message_text = AsyncMock(
+            side_effect=[Exception("invalid markdown"), None]
+        )
+
+        result = await adapter.edit_message(
+            "123", "456", "[link](https://example.com)", finalize=True
+        )
+
+        assert result.success is True
+        assert adapter._bot.edit_message_text.await_count == 2
+        for call in adapter._bot.edit_message_text.call_args_list:
+            self._assert_link_previews_disabled(call.kwargs)
+
+    @pytest.mark.asyncio
+    async def test_overflow_first_edit_applies_disabled_link_preview_policy(self):
+        adapter = TelegramAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="fake-token",
+                extra={"disable_link_previews": True},
+            )
+        )
+        adapter.MAX_MESSAGE_LENGTH = 80
+        adapter._bot = MagicMock()
+        adapter._bot.edit_message_text = AsyncMock()
+        adapter._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=1000)
+        )
+
+        result = await adapter.edit_message(
+            "123",
+            "456",
+            "https://example.com/" + "x" * 160,
+            finalize=True,
+        )
+
+        assert result.success is True
+        self._assert_link_previews_disabled(
+            adapter._bot.edit_message_text.call_args_list[0].kwargs
+        )
+
+    @pytest.mark.asyncio
+    async def test_edits_leave_link_preview_policy_unset_when_enabled(self):
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+        adapter._bot = MagicMock()
+        adapter._bot.edit_message_text = AsyncMock()
+
+        result = await adapter.edit_message(
+            "123", "456", "https://example.com", finalize=False
+        )
+
+        assert result.success is True
+        kwargs = adapter._bot.edit_message_text.call_args.kwargs
+        assert "link_preview_options" not in kwargs
+        assert "disable_web_page_preview" not in kwargs
+
 
     @pytest.mark.asyncio
     async def test_message_too_long_splits_into_continuations_not_silent_truncation(self):

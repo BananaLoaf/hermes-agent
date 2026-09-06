@@ -1954,6 +1954,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
         return {"disable_web_page_preview": True}
 
+    async def _edit_text_with_platform_options(self, **kwargs: Any) -> Any:
+        """Edit arbitrary bot text with the configured link-preview policy."""
+        return await self._bot.edit_message_text(
+            **kwargs,
+            **self._link_preview_kwargs(),
+        )
+
     # ------------------------------------------------------------------
     # Bot API 10.1 Rich Messages (sendRichMessage)
     #
@@ -5846,7 +5853,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             if not finalize:
-                await self._bot.edit_message_text(
+                await self._edit_text_with_platform_options(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=content,
@@ -5857,7 +5864,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             formatted = self.format_message(content)
             try:
-                await self._bot.edit_message_text(
+                await self._edit_text_with_platform_options(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=formatted,
@@ -5875,7 +5882,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     safe_format_error,
                 )
                 _plain = _strip_mdv2(content) if content else content
-                await self._bot.edit_message_text(
+                await self._edit_text_with_platform_options(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=_plain,
@@ -5903,7 +5910,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 if self._last_overflow_preview.get(_preview_key) == truncated:
                     # Saturated-preview dedup (see pre-flight path above).
                     return SendResult(success=True, message_id=message_id)
-                await self._bot.edit_message_text(
+                await self._edit_text_with_platform_options(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=truncated,
@@ -5924,7 +5931,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     return _flood_cap_result(wait)
                 await asyncio.sleep(wait)
                 try:
-                    await self._bot.edit_message_text(
+                    await self._edit_text_with_platform_options(
                         chat_id=normalize_telegram_chat_id(chat_id),
                         message_id=int(message_id),
                         text=content,
@@ -6030,7 +6037,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.format_message(first_chunk)
                 )
                 try:
-                    await self._bot.edit_message_text(
+                    await self._edit_text_with_platform_options(
                         chat_id=normalize_telegram_chat_id(chat_id),
                         message_id=int(message_id),
                         text=formatted,
@@ -6043,13 +6050,13 @@ class TelegramAdapter(BasePlatformAdapter):
                             "failed, falling back to plain text: %s",
                             self.name, _redact_telegram_error_text(fmt_err),
                         )
-                        await self._bot.edit_message_text(
+                        await self._edit_text_with_platform_options(
                             chat_id=normalize_telegram_chat_id(chat_id),
                             message_id=int(message_id),
                             text=_strip_mdv2(first_chunk),
                         )
             else:
-                await self._bot.edit_message_text(
+                await self._edit_text_with_platform_options(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=first_chunk,
