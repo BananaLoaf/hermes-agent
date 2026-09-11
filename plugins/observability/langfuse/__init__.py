@@ -32,6 +32,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -84,6 +85,7 @@ _LANGFUSE_CLIENT_LOCK = threading.Lock()
 _READ_FILE_LINE_RE = re.compile(r"^\s*(\d+)\|(.*)$")
 _READ_FILE_HEAD_LINES = 25
 _READ_FILE_TAIL_LINES = 15
+_LANGFUSE_ID_MAX_CHARS = 200
 
 # Langfuse-issued keys always carry these prefixes (cloud or self-hosted —
 # the prefix is baked into the server-side issuance flow, not a UI hint).
@@ -116,6 +118,59 @@ def _debug_enabled() -> bool:
 def _debug(message: str) -> None:
     if _debug_enabled():
         logger.info("Langfuse tracing: %s", message)
+
+
+@dataclass(frozen=True)
+class TraceIdentity:
+    user_id: Optional[str]
+    tags: list[str]
+    metadata: dict[str, str]
+
+
+def _identity_value(value: Any, *, lowercase: bool = False) -> str:
+    """Normalize an identity value without changing its external meaning."""
+    text = unicodedata.normalize(
+        "NFKC", "" if value is None else str(value)
+    ).strip()
+    return text.casefold() if lowercase else text
+
+
+def _platform_user_id(value: Any) -> str:
+    """Return a Langfuse-safe string ID, bounded to its attribute limit."""
+    return _identity_value(value)[:_LANGFUSE_ID_MAX_CHARS]
+
+
+def _build_trace_identity(
+    *,
+    platform_name: str,
+    platform_user_id: Any,
+    profile_name: str = "",
+) -> TraceIdentity:
+    """Build Langfuse user attribution and the requested trace tags."""
+    platform = _identity_value(platform_name, lowercase=True)
+    platform_user = _platform_user_id(platform_user_id)
+    profile = _identity_value(profile_name)
+
+    tags = ["hermes", "langfuse"]
+    for tag in (platform, platform_user):
+        if tag and tag not in tags:
+            tags.append(tag)
+
+    metadata = {
+        "platform_name": platform,
+        "platform_user_id": platform_user,
+        "profile_name": profile,
+    }
+    metadata = {key: value for key, value in metadata.items() if value}
+
+    if profile:
+        user_id = profile
+        metadata["user_identity_source"] = "profile"
+    else:
+        user_id = None
+        metadata["user_id_unset_reason"] = "profile_missing"
+
+    return TraceIdentity(user_id=user_id, tags=tags, metadata=metadata)
 
 
 # ---------------------------------------------------------------------------
@@ -882,9 +937,15 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
 
 def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
                       api_mode: str, messages: Any, client: Langfuse,
-                      turn_id: str = "", api_request_id: str = "") -> TraceState:
+                      turn_id: str = "", api_request_id: str = "",
+                      platform_user_id: Any = "", profile_name: str = "") -> TraceState:
     trace_id = client.create_trace_id(seed=f"{session_id or 'sessionless'}::{task_id or task_key}")
     trace_input = _extract_last_user_message(messages)
+    identity = _build_trace_identity(
+        platform_name=platform,
+        platform_user_id=platform_user_id,
+        profile_name=profile_name,
+    )
     metadata = {
         "source": "hermes",
         "task_id": task_id,
@@ -895,6 +956,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "model": model,
         "api_mode": api_mode,
         "capture_mode": _capture_mode(),
+        **identity.metadata,
     }
 
     # session_id must be passed in trace_context for Langfuse session grouping.
@@ -904,11 +966,15 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
 
     if propagate_attributes is not None:
         try:
-            with propagate_attributes(
-                session_id=session_id or task_key,
-                trace_name="Hermes turn",
-                tags=["hermes", "langfuse"],
-            ):
+            propagated = {
+                "session_id": session_id or task_key,
+                "trace_name": "Hermes turn",
+                "tags": identity.tags,
+                "metadata": metadata,
+            }
+            if identity.user_id:
+                propagated["user_id"] = identity.user_id
+            with propagate_attributes(**propagated):
                 root_ctx = client.start_as_current_observation(
                     trace_context=trace_ctx,
                     name="Hermes turn",
@@ -942,9 +1008,18 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     # SDK v3 uses update_trace() (not set_trace_io). Failures must never block
     # the rest of the turn — the observation still carries input from start.
     try:
-        root_span.update_trace(input=trace_input)
+        trace_update = {
+            "input": trace_input,
+            "tags": identity.tags,
+            "metadata": metadata,
+        }
+        if session_id:
+            trace_update["session_id"] = session_id
+        if identity.user_id:
+            trace_update["user_id"] = identity.user_id
+        root_span.update_trace(**trace_update)
     except Exception as exc:
-        _debug(f"update_trace(input) failed: {exc}")
+        _debug(f"update_trace failed: {exc}")
 
     _debug(f"started trace {trace_id} for {task_key}")
     return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
@@ -1147,7 +1222,9 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
                     provider: str = "", base_url: str = "", api_mode: str = "",
                     api_call_count: int = 0, messages: Any = None, turn_type: str = "user",
                     conversation_history: Any = None, user_message: Any = None,
-                    turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
+                    turn_id: str = "", api_request_id: str = "",
+                    platform_user_id: Any = "", sender_id: Any = "",
+                    profile_name: str = "", **_: Any) -> None:
     # Older Hermes branches used pre_llm_call for request-scoped tracing and
     # passed the actual API messages. Current Hermes also has a turn-scoped
     # pre_llm_call used for context injection; tracing that hook creates an
@@ -1186,6 +1263,13 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
                 client=client,
                 turn_id=turn_id,
                 api_request_id=api_request_id,
+                platform_user_id=(
+                    platform_user_id
+                    if platform_user_id is not None
+                    and str(platform_user_id).strip()
+                    else sender_id
+                ),
+                profile_name=profile_name,
             )
             _evict_stale_locked()
             _TRACE_STATE[task_key] = state
@@ -1287,6 +1371,8 @@ def on_pre_llm_request(
     api_request_id: str = "",
     request: Any = None,
     system_prompt: Any = None,
+    platform_user_id: Any = "",
+    profile_name: str = "",
     **_: Any,
 ) -> None:
     client = _get_langfuse()
@@ -1345,6 +1431,8 @@ def on_pre_llm_request(
                 client=client,
                 turn_id=turn_id,
                 api_request_id=api_request_id,
+                platform_user_id=platform_user_id,
+                profile_name=profile_name,
             )
             _evict_stale_locked()
             _TRACE_STATE[task_key] = state

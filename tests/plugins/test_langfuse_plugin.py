@@ -216,6 +216,156 @@ class TestTraceScopeKey:
         assert "turn:turn-b" in key_b
 
 
+class TestTraceIdentity:
+    def _fresh_plugin(self):
+        mod_name = "plugins.observability.langfuse"
+        sys.modules.pop(mod_name, None)
+        return importlib.import_module(mod_name)
+
+    def test_profile_is_user_and_platform_identity_is_tagged(self):
+        plugin = self._fresh_plugin()
+
+        identity = plugin._build_trace_identity(
+            profile_name="manager",
+            platform_name="Telegram",
+            platform_user_id="1067602182",
+        )
+
+        assert identity.user_id == "manager"
+        assert identity.tags == [
+            "hermes",
+            "langfuse",
+            "telegram",
+            "1067602182",
+        ]
+        assert identity.metadata["user_identity_source"] == "profile"
+
+    def test_platform_user_is_only_a_tag_without_profile(self):
+        plugin = self._fresh_plugin()
+
+        identity = plugin._build_trace_identity(
+            platform_name="telegram",
+            platform_user_id="1067602182",
+        )
+
+        assert identity.user_id is None
+        assert identity.tags == [
+            "hermes",
+            "langfuse",
+            "telegram",
+            "1067602182",
+        ]
+        assert identity.metadata["user_id_unset_reason"] == "profile_missing"
+
+    def test_api_server_profile_is_user_without_platform_user_tag(self):
+        plugin = self._fresh_plugin()
+
+        identity = plugin._build_trace_identity(
+            profile_name="user_example_com",
+            platform_name="api_server",
+            platform_user_id="",
+        )
+
+        assert identity.user_id == "user_example_com"
+        assert identity.tags == ["hermes", "langfuse", "api_server"]
+
+    def test_missing_user_is_left_unset(self):
+        plugin = self._fresh_plugin()
+
+        identity = plugin._build_trace_identity(
+            platform_name="cli",
+            platform_user_id="",
+        )
+
+        assert identity.user_id is None
+        assert identity.tags == ["hermes", "langfuse", "cli"]
+        assert identity.metadata["user_id_unset_reason"] == "profile_missing"
+
+    def test_numeric_platform_user_id_is_converted_to_string(self):
+        plugin = self._fresh_plugin()
+
+        identity = plugin._build_trace_identity(
+            platform_name="test_platform",
+            platform_user_id=0,
+        )
+
+        assert identity.user_id is None
+        assert identity.tags[-1] == "0"
+        assert identity.metadata["platform_user_id"] == "0"
+
+    def test_platform_user_id_is_truncated_to_langfuse_limit(self):
+        plugin = self._fresh_plugin()
+        long_id = "x" * (plugin._LANGFUSE_ID_MAX_CHARS + 50)
+
+        identity = plugin._build_trace_identity(
+            profile_name="manager",
+            platform_name="custom_platform",
+            platform_user_id=long_id,
+        )
+
+        expected_id = long_id[:plugin._LANGFUSE_ID_MAX_CHARS]
+        assert identity.user_id == "manager"
+        assert identity.tags[-1] == expected_id
+        assert identity.metadata["platform_user_id"] == expected_id
+
+    def test_identity_is_written_to_langfuse_trace(self, monkeypatch):
+        plugin = self._fresh_plugin()
+        captured = {}
+
+        class RootSpan:
+            def update_trace(self, **kwargs):
+                captured["trace_update"] = kwargs
+
+        class RootContext:
+            def __enter__(self):
+                return RootSpan()
+
+            def __exit__(self, *exc):
+                return False
+
+        class Client:
+            def create_trace_id(self, seed=None):
+                return f"trace::{seed}"
+
+            def start_as_current_observation(self, **kwargs):
+                captured["root"] = kwargs
+                return RootContext()
+
+        class Propagated:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *exc):
+                return False
+
+        def propagate(**kwargs):
+            captured["propagated"] = kwargs
+            return Propagated()
+
+        monkeypatch.setattr(plugin, "propagate_attributes", propagate)
+
+        plugin._start_root_trace(
+            "task-key",
+            task_id="task-id",
+            session_id="session-id",
+            platform="telegram",
+            provider="openai",
+            model="gpt-test",
+            api_mode="responses",
+            messages=[{"role": "user", "content": "hello"}],
+            client=Client(),
+            profile_name="manager",
+            platform_user_id="1067602182",
+        )
+
+        expected_tags = ["hermes", "langfuse", "telegram", "1067602182"]
+        assert captured["propagated"]["user_id"] == "manager"
+        assert captured["propagated"]["tags"] == expected_tags
+        assert captured["trace_update"]["user_id"] == "manager"
+        assert captured["trace_update"]["tags"] == expected_tags
+        assert captured["trace_update"]["metadata"]["profile_name"] == "manager"
+
+
 # ---------------------------------------------------------------------------
 # End-to-end collision regression: two turns of ONE gateway session must not
 # share trace state.  The helper-level tests above prove _trace_key returns

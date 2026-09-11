@@ -194,6 +194,8 @@ _DEFAULT_PAYLOADS = {
         "approx_input_tokens": 2048,
         "request_char_count": 8192,
         "max_tokens": 4096,
+        "platform_user_id": "test-user",
+        "profile_name": "test-profile",
     },
     "post_api_request": {
         "session_id": "test-session",

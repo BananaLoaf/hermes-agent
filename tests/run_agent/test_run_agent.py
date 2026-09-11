@@ -3239,6 +3239,8 @@ class TestRunConversation:
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
+        agent.platform = "telegram"
+        agent._user_id = "1067602182"
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
         resp2 = _mock_response(content="Done searching", finish_reason="stop")
@@ -3257,6 +3259,10 @@ class TestRunConversation:
                 side_effect=lambda name: name in {"pre_api_request", "post_api_request"},
             ),
             patch("hermes_cli.lifecycle.invoke_hook", side_effect=_record_hook),
+            patch(
+                "hermes_cli.profiles.get_active_profile_name",
+                return_value="manager",
+            ),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -3278,6 +3284,9 @@ class TestRunConversation:
         ]
         assert all("message_count" in c and isinstance(c.get("request_messages"), list) for c in pre_request_calls)
         assert all("request" in c and "messages" in c["request"]["body"] for c in pre_request_calls)
+        assert all(c["platform"] == "telegram" for c in pre_request_calls)
+        assert all(c["platform_user_id"] == "1067602182" for c in pre_request_calls)
+        assert all(c["profile_name"] == "manager" for c in pre_request_calls)
         assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
