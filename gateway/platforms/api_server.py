@@ -4349,6 +4349,21 @@ class APIServerAdapter(OpenAIFilesRoutesMixin, BasePlatformAdapter):
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
 
+    async def _resolve_live_session_id(self, session_id: str) -> str:
+        """Resolve a compressed session to its live continuation, failing open."""
+        db = await self._ensure_session_db_async()
+        resolver = getattr(db, "resolve_resume_session_id", None) if db is not None else None
+        if not callable(resolver):
+            return session_id
+        try:
+            resolved = await asyncio.to_thread(resolver, session_id)
+            return str(resolved) if resolved else session_id
+        except Exception:
+            logger.debug(
+                "Live-session resolve failed for %s", session_id, exc_info=True
+            )
+            return session_id
+
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
         auth_err = self._check_auth(request)
@@ -6652,7 +6667,8 @@ class APIServerAdapter(OpenAIFilesRoutesMixin, BasePlatformAdapter):
         # stateless clients separate prior messages from the current input.
         # Precedence: explicit conversation_history > previous_response_id.
         conversation_history: List[Dict[str, Any]] = []
-        if raw_history:
+        has_explicit_history = raw_history is not None
+        if has_explicit_history:
             if not isinstance(raw_history, list):
                 return web.json_response(
                     _openai_error(
@@ -6691,7 +6707,7 @@ class APIServerAdapter(OpenAIFilesRoutesMixin, BasePlatformAdapter):
         stored_client_session_id = None
         if previous_response_id:
             stored = self._response_store.get(previous_response_id)
-            if stored is None and not conversation_history:
+            if stored is None and not has_explicit_history:
                 return web.json_response(
                     _openai_error(
                         f"Previous response not found: {previous_response_id}"
@@ -6701,12 +6717,31 @@ class APIServerAdapter(OpenAIFilesRoutesMixin, BasePlatformAdapter):
             if stored is not None:
                 stored_session_id = stored.get("session_id")
                 stored_client_session_id = stored.get("client_session_id")
-                if not conversation_history:
+                if not has_explicit_history:
                     conversation_history = list(stored.get("conversation_history", []))
                 # Preserve Responses API metadata continuity. _create_agent()
                 # applies the configured managed-vs-client prompt policy.
                 if instructions is None:
                     instructions = stored.get("instructions")
+
+        # A client-managed ID is also a durable transcript address. Resolve a
+        # pre-compression parent to its live continuation before loading state,
+        # then recover SessionDB history when the request carries only its new
+        # input. Explicit client context and response chains remain authoritative
+        # and must never be duplicated with the durable transcript.
+        resolved_client_session_id = provided_session_id
+        if provided_session_id:
+            resolved_client_session_id = await self._resolve_live_session_id(
+                provided_session_id
+            )
+            if (
+                not has_explicit_history
+                and not previous_response_id
+                and len(input_messages) <= 1
+            ):
+                conversation_history = await self._conversation_history_for_session(
+                    resolved_client_session_id
+                )
 
         # Append new input messages to history (all but the last become history)
         for msg in input_messages[:-1]:
@@ -6732,7 +6767,7 @@ class APIServerAdapter(OpenAIFilesRoutesMixin, BasePlatformAdapter):
             and stored_client_session_id == provided_session_id
         )
         session_id = (
-            stored_session_id if _resume_rotated_session else provided_session_id
+            stored_session_id if _resume_rotated_session else resolved_client_session_id
         ) or (
             stored_session_id
             or str(uuid.uuid4())
