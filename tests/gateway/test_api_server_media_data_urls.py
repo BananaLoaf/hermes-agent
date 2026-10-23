@@ -4,6 +4,7 @@ import base64
 import asyncio
 import time
 import uuid
+import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,6 +13,8 @@ pytest.importorskip("aiohttp")
 
 from aiohttp import web  # noqa: E402
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
+
+from gateway.platforms.api_server import _resolve_media_to_data_urls
 
 from gateway.config import PlatformConfig  # noqa: E402
 from gateway.outbound_files import (  # noqa: E402
@@ -24,12 +27,50 @@ from gateway.outbound_files import (  # noqa: E402
 )
 from gateway.platforms.api_server import APIServerAdapter  # noqa: E402
 
+_PNG_BYTES = b'\x89PNG\r\n\x1a\n'
+
 
 def _openai_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application()
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     return app
+
+class TestResolveMediaToDataUrls(unittest.TestCase):
+    def _write_png(self, tmpdir_name="hermes_media_test"):
+        import tempfile
+        from pathlib import Path
+
+        d = Path(tempfile.mkdtemp(prefix=tmpdir_name))
+        p = d / "shot.png"
+        p.write_bytes(_PNG_BYTES)
+        return p
+
+    def test_media_tag_inlined(self):
+        p = self._write_png()
+        out = _resolve_media_to_data_urls(f"Here you go: MEDIA:{p}")
+        self.assertIn("data:image/png;base64,", out)
+        self.assertNotIn("MEDIA:", out)
+
+    def test_backtick_wrapped_tag(self):
+        p = self._write_png()
+        out = _resolve_media_to_data_urls(f"See `MEDIA:{p}` above")
+        self.assertIn("data:image/png;base64,", out)
+
+    def test_terminal_eos_sentinel_does_not_block_inlining(self):
+        """A leaked terminal ``<|eos|>`` glued to the tag (#111046) inlines exactly like the clean
+        response; the control token is dropped rather than returned to the HTTP client."""
+        p = self._write_png()
+        clean = f"Here you go: MEDIA:{p}"
+        self.assertEqual(_resolve_media_to_data_urls(clean + "<|eos|>"), _resolve_media_to_data_urls(clean))
+
+    def test_missing_file_left_untouched(self):
+        text = "MEDIA:/nonexistent/path/shot.png"
+        self.assertEqual(_resolve_media_to_data_urls(text), text)
+
+    def test_non_image_left_untouched(self):
+        text = "MEDIA:/tmp/archive.zip"
+        self.assertEqual(_resolve_media_to_data_urls(text), text)
 
 
 def _agent_result(text: str) -> tuple[dict, dict]:
