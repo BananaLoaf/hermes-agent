@@ -1,7 +1,6 @@
 """CLI handlers for ``hermes migrate ...``.
 
-Currently exposes only ``hermes migrate xai`` — diagnoses and (with --apply) rewrites references to
-xAI models retired on May 15, 2026.
+Model/settings migrations and explicit legacy Responses recovery. Subcommand parsers own dispatch.
 """
 from __future__ import annotations
 
@@ -18,7 +17,7 @@ def cmd_migrate(args: Any) -> int:
     if getattr(args, "migrate_type", None) == "xai":
         return cmd_migrate_xai(args)
 
-    print("usage: hermes migrate xai [--apply] [--no-backup]", file=sys.stderr)
+    print("usage: hermes migrate {xai,relay,responses} [options]", file=sys.stderr)
     return 2
 
 

@@ -63,7 +63,7 @@ The install also ships `hermes-agent`, a minimal runner that sends one query and
 | `hermes send` | Send a one-shot message to a configured messaging platform (Telegram, Discord, Slack, Signal, SMS, …). Useful from shell scripts, cron jobs, CI hooks, and monitoring daemons — no agent loop, no LLM. |
 | `hermes peer` | Register peer Hermes gateways on other machines and DM their agents' canonical Bot Chats (`hermes peer dm <peer>[/<agent>] "…"`). The transport behind cross-machine bot-to-bot messaging. |
 | `hermes secrets` | Manage external secret sources (currently Bitwarden Secrets Manager) for pulling API keys at process startup instead of from `~/.hermes/.env`. |
-| `hermes migrate` | Diagnose and (optionally) rewrite `config.yaml` to replace references to retired models or deprecated settings (e.g. `migrate xai`). |
+| `hermes migrate` | Diagnose deprecated settings or explicitly recover legacy shared Responses state (e.g. `migrate xai`, `migrate responses`). |
 | `hermes codex-runtime` | Noninteractive counterpart of `/codex-runtime`: `migrate [--dry-run] [--json]` regenerates the Hermes-managed block in `~/.codex/config.toml` for the selected profile. See [Codex app-server runtime](../user-guide/features/codex-app-server-runtime.md#running-the-migration-from-a-script). |
 | `hermes status` | Show agent, auth, and platform status. |
 | `hermes usage` | Show the configured account's rate-limit windows (the `/usage` block) without a session; `--json` for scripts. |
@@ -601,20 +601,59 @@ Pull API keys from an external secret manager at process startup instead of stor
 hermes migrate <type>
 ```
 
-Diagnose and (optionally) rewrite the active `config.yaml` to replace references to retired models or deprecated settings. A timestamped backup of the original `config.yaml` is taken before any rewrite (skip with `--no-backup`).
+Diagnose deprecated settings or explicitly migrate legacy data. Configuration rewrites and Responses recovery are separate operations; neither runs automatically through this command.
 
 | Subcommand | Description |
 |------------|-------------|
 | `xai` | Scan `config.yaml` for references to xAI models scheduled for retirement on May 15, 2026 and (with `--apply`) rewrite them in-place to the official replacements per the xAI migration guide. Defaults to dry-run. |
+| `responses` | Copy legacy shared Responses records into the owning profiles' databases. Defaults to dry-run; `--apply` copies only absent records and backs up existing destination databases first. |
 
-Common flags for migration subcommands:
+Flags for `migrate xai`:
 
 | Flag | Description |
 |------|-------------|
 | `--apply` | Rewrite `config.yaml` in-place (default: dry-run, no writes). |
 | `--no-backup` | Skip the timestamped backup of `config.yaml` when applying. |
 
-> Not to be confused with `hermes import-agent openclaw` (one-shot import of OpenClaw configuration into Hermes) — `hermes migrate` is the top-level config-rewrite command.
+### Recovering legacy shared Responses state
+
+Older multiplexed API gateways stored every profile's Responses in the launch home's
+`response_store.db`. Newer gateways isolate them under each profile home. To recover old
+`previous_response_id` chains without replacing newer profile data:
+
+```bash
+hermes migrate responses                 # preview only; no files created or changed
+hermes migrate responses --apply         # explicitly copy missing records
+hermes migrate responses --source /path/to/shared-backup.db --apply
+```
+
+The source defaults to `<default Hermes home>/response_store.db`, including Docker/custom
+homes. Targets are the existing live named profiles under that home's `profiles/` directory.
+Ownership requires the stored `session_id` to exist in exactly one profile's canonical
+`state.db`; the client-supplied model name is not used. Deleted profiles still count when
+checking ambiguity but are never written. Unresolved, ambiguous and invalid records are
+reported and skipped; an unreadable canonical database aborts the operation rather than
+guessing an owner. Only surviving cached responses can be recovered: this does not rebuild
+records already evicted from the old shared store or copy the canonical session transcripts.
+
+The source database, profile `state.db`, configuration and credentials are not changed.
+Existing response IDs and conversation-name pointers always win. A conflicting response
+body is skipped, and no legacy conversation pointer is attached to that conflicting body.
+New request/idempotency tables are left untouched. Re-running is safe, including after a
+partially completed run; each profile's inserts are one SQLite transaction, with collisions
+rechecked under the write lock. Existing destinations are backed up using SQLite's backup
+API (including committed WAL contents) to
+`<default Hermes home>/backups/response-store-migration/<timestamp>/<profile>.bak`.
+The command does not call the LLM and never installs a shared-store lookup fallback.
+
+The migration deliberately does **not** run LRU eviction. If the merged database exceeds
+the runtime's Responses retention limit (currently 100 bodies per profile), it prints a
+warning: a later gateway open/write can evict older records under the normal retention policy.
+Keep the source and backups. Prefer a quiet deployment window for a consistent ownership
+inventory; regular response writes are protected by SQLite transactions, but do not rename
+or delete profiles during the migration.
+
+> Not to be confused with `hermes import-agent openclaw` (one-shot import of another agent's configuration).
 
 
 ## `hermes codex-runtime`

@@ -8,9 +8,8 @@ def build_migrate_parser(subparsers) -> None:
     from hermes_cli.migrate import cmd_migrate, cmd_migrate_xai
 
     migrate_parser = subparsers.add_parser(
-        "migrate", help="Migrate configuration for retired models or deprecated settings",
-        description="Diagnose and (optionally) rewrite the active config.yaml to "
-            "replace references to retired models or deprecated settings.")
+        "migrate", help="Migrate deprecated settings or recover legacy Responses state",
+        description="Diagnose and explicitly migrate retired configuration or legacy Responses state.")
     migrate_subparsers = migrate_parser.add_subparsers(dest="migrate_type")
 
     migrate_xai = migrate_subparsers.add_parser(
@@ -39,9 +38,25 @@ def build_migrate_parser(subparsers) -> None:
         "--no-validate", action="store_true",
         help="Skip activating the generated file through Relay's validator before writing it")
     migrate_relay.set_defaults(func=_cmd_migrate_relay)
+
+    responses = migrate_subparsers.add_parser(
+        "responses", help="Copy legacy shared Responses state into owning profile databases",
+        description="Preview copying shared response_store.db records into their owning profiles. "
+            "Ownership is checked against profile state.db sessions. Source and existing destination "
+            "records are never overwritten; existing destination databases are backed up before copying.")
+    responses.add_argument("--apply", action="store_true", help="Copy missing records (default: dry-run, no writes)")
+    from pathlib import Path
+    responses.add_argument("--source", type=Path, metavar="DB",
+                           help="Shared database or backup (default: <default Hermes home>/response_store.db)")
+    responses.set_defaults(func=_cmd_migrate_responses)
     migrate_parser.set_defaults(func=cmd_migrate)
 
 
 def _cmd_migrate_relay(args) -> None:
     from hermes_cli.relay_plugin_migrate import cmd_migrate_relay
     cmd_migrate_relay(args)
+
+
+def _cmd_migrate_responses(args) -> int:
+    from hermes_cli.response_store_migrate import cmd_migrate_responses
+    return cmd_migrate_responses(args)
