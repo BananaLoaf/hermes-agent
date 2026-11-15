@@ -140,8 +140,10 @@ from tools.approval import (
 )
 
 
-def _docker_volume_uses_host_path(volume_spec: str) -> bool:
+def _docker_volume_uses_host_path(volume_spec: str | dict) -> bool:
     """Return True when a docker volume spec bind-mounts a host path."""
+    if isinstance(volume_spec, dict):
+        volume_spec = volume_spec.get("source", "")
     if not isinstance(volume_spec, str):
         return False
     vol = volume_spec.strip()
@@ -511,6 +513,12 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
        keys its own home (``profile:<name>`` under persistent Docker, matching branch 3);
        else ``"default"``, which subagent ids collapse onto to share the parent's container.
     """
+    _ensure_terminal_env_bridged()
+    if _tenv('TERMINAL_ISOLATION_SCOPE', 'default') == 'profile' and _tenv('TERMINAL_ENV', 'local') == 'docker':
+        if task_id and _has_isolation_overrides(task_id):
+            raise ValueError('Profile Docker scope does not accept per-task image/backend overrides')
+        from tools.environments.docker_profile import cache_key
+        return cache_key(_get_env_config())
     if task_id and _has_isolation_overrides(task_id):
         return _qualify_task_key(task_id)
     scope = _session_scope()
@@ -807,7 +815,9 @@ def _get_env_config() -> dict[str, Any]:
 
     cwd, host_cwd = _resolve_config_cwd(env_type, mount_docker_cwd)
 
+    from tools.environments.docker_profile import profile_scope
     return {
+        "docker_profile_scope": profile_scope() if env_type == "docker" else None,
         "env_type": env_type,
         "modal_mode": coerce_modal_mode(_tenv("TERMINAL_MODAL_MODE", "auto")),
         "docker_image": _tenv("TERMINAL_DOCKER_IMAGE", default_image),
