@@ -1126,7 +1126,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         media_tail = await outbound.finish(result.get("final_response", "") if raw_deltas_received else None)
         if media_tail:
             run.put_event(_run_event(run_id, "message.delta", delta=media_tail))
-        final_response = await outbound.render(result.get("final_response", ""))
+        with self._profile_scope(run.request_profile):
+            final_response = await self._render_final_outbound_text(result, outbound)
         # The committed outcome decides: a stop issued over WS by another viewer interrupts
         # this run just as much as one issued through this adapter's own /stop.
         status, fields = terminal_run_status(result)

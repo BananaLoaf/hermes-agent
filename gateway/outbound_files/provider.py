@@ -4,13 +4,15 @@ from collections.abc import Mapping
 from dataclasses import fields
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Optional, Self
+from typing import Any, ClassVar, Optional, Self
 
 from gateway.outbound_files.config import OutboundFilesConfigError
 
 
 class OutboundFileProvider(ABC):
     """Turn a validated local path into client-visible response text."""
+
+    persist_rendered_text: ClassVar[bool] = False
 
     @classmethod
     def from_options(cls, raw: Mapping[str, Any], *, provider_name: str) -> Self:

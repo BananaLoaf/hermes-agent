@@ -92,9 +92,20 @@ def run_projection(adapter, run_id):
         pending = list(live.controls.snapshot(row['target_session_id'], row['generation']))
         if any(prompt.get('kind') == 'approval' for prompt in pending):
             status = 'waiting_for_approval'  # the documented run state main's run store reports
+    output = result.get('final_response', '')
+    if status == 'completed' and isinstance(output, str) and 'MEDIA:' in output:
+        from gateway.session_api_media import stored_reply_display_text
+        rendered = stored_reply_display_text(authority.db, result)
+        if isinstance(rendered, str):
+            output = rendered
+        # The agent can settle before the run's outbound file upload finishes.
+        elif adapter._outbound_files.provider.persist_rendered_text:
+            delivery = adapter._run_statuses.get(run_id, {})
+            if delivery.get('status') in ('running', 'completed'):
+                status, output = delivery['status'], delivery.get('output', '')
     return {'pending_controls': pending, 'run_id': run_id, 'status': status, 'session_id': row['target_session_id'],
             'admission_id': row['admission_id'], 'execution_generation': row['generation'],
-            'output': result.get('final_response', ''), 'usage': saved.get('usage', {}) if saved else {}}
+            'output': output, 'usage': saved.get('usage', {}) if saved else {}}
 
 
 async def send_clarify(adapter, *, chat_id, **kwargs):

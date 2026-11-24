@@ -174,6 +174,8 @@ def _markdown_label(value: str) -> str:
 class ZiplineOutboundFileProvider(OutboundFileProvider):
     """Upload files through Zipline and render their public URLs as Markdown."""
 
+    persist_rendered_text: ClassVar[bool] = True
+
     base_url: str
     api_key: Optional[str] = field(default=None, repr=False)
     file_expiry: Optional[str] = "7d"

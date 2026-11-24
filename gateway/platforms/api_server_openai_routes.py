@@ -586,7 +586,8 @@ class _ResponsesStream:
             if self.terminal_replay:
                 # The receipt already contains the transformed final; it is not a raw provider
                 # stream onto which a verifier/footer transform should be applied a second time.
-                self.final_response_text = agent_final or self._api._redact_api_error_text(
+                self.final_response_text = await self.adapter._render_final_outbound_text(
+                    result, replay=True) or self._api._redact_api_error_text(
                     result.get('error', '(No response generated)'))
                 self.final_text_parts = [self.final_response_text]
                 return
@@ -595,7 +596,7 @@ class _ResponsesStream:
             media_tail = await self.outbound.finish(stream_final)
             if media_tail:
                 await self.emit_text_delta(media_tail)
-            agent_final = await self.outbound.render(agent_final)
+            agent_final = await self.adapter._render_final_outbound_text(result, self.outbound)
             tail, appended = _post_stream_transform(result)
             if tail and self.final_text_parts:
                 if appended:
@@ -1496,7 +1497,7 @@ class OpenAICompatRoutesMixin:
             if _settled(replay):
                 return web.json_response(replay['response'], headers=replay.get('headers') or {})
         result, usage = outcome
-        final_response = await self._render_outbound_text(result.get("final_response", ""))
+        final_response = await self._render_final_outbound_text(result)
         if not final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
         full_history = self._build_response_conversation_history(
