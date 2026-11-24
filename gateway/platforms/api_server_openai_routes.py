@@ -1415,10 +1415,11 @@ class OpenAICompatRoutesMixin:
             return replayed
         from gateway.platforms.api_server_response_admissions import prepare_context
         from hermes_state_runtime import RuntimeStoreError
+        import sqlite3
         try:
             context, error = await prepare_context(
                 self, request, body, gateway_session_key, durable_key, idempotency_scope, idempotency_key)
-        except RuntimeStoreError as exc:
+        except (RuntimeStoreError, sqlite3.Error, OSError) as exc:
             from gateway.platforms.api_server import _openai_error
             from gateway.platforms.api_server_authority_runs import store_error_response
             return store_error_response(_openai_error, exc)
@@ -1577,6 +1578,8 @@ class OpenAICompatRoutesMixin:
         """
         from gateway.platforms.api_server import APIServerAdapter
         prior = list(conversation_history)
+        if isinstance(result, dict) and result.get('_rolled_back'):
+            return _cap_history_tool_outputs(prior, tool_output_max_chars)
         current_user = {"role": "user", "content": user_message}
         if isinstance(result, dict) and isinstance(result.get("_turn_user_row"), dict):
             current_user = dict(result["_turn_user_row"])  # settled canonical turn: carries api_content

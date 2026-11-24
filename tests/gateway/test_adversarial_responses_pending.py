@@ -8,6 +8,64 @@ from aiohttp.test_utils import TestClient, TestServer
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('compaction', ['none', 'in_place', 'rotation'])
+async def test_new_responses_request_rolls_back_lost_turn(api, owner, compaction):
+    from gateway.session_api_turn import api_execution
+    from gateway.session_results import execution_result
+    from hermes_state_runtime import (
+        admit_session_input, begin_runtime_epoch, claim_session_input, get_session_admission, recover_session_inputs,
+    )
+
+    api._responses_client_managed_session_id = True
+    api._api_key = 'test-key'
+    calls = []
+
+    async def handle(event):
+        calls.append((event.text, api_execution.get()['history']))
+        execution_result.get()['result'] = {'final_response': 'answer', 'messages': []}
+        return 'answer'
+
+    owner.runner._handle_message = handle
+    app = web.Application()
+    app.router.add_post('/v1/responses', api._handle_responses)
+    async with TestClient(TestServer(app)) as client:
+        headers = {'X-Hermes-Session-Id': 'continued-chat', 'Authorization': 'Bearer test-key'}
+        first = await client.post('/v1/responses', json={'input': 'first'}, headers=headers)
+        assert first.status == 200
+        sid = first.headers['X-Hermes-Session-Id']
+        good = [{'role': 'user', 'content': 'first'}, {'role': 'assistant', 'content': 'answer'}]
+        owner.db.append_messages_batch(sid, good)
+        lost = admit_session_input(owner.db, epoch=owner.epoch, principal_id='api', session_id=sid,
+                                   request_id='lost', payload={'text': 'lost input'})
+        claim_session_input(owner.db, epoch=owner.epoch, session_id=sid)
+        owner.db.append_message(sid, 'user', 'lost input')
+        owner.db.append_message(sid, 'assistant', 'partial answer')
+        queued = admit_session_input(owner.db, epoch=owner.epoch, principal_id='api', session_id=sid,
+            request_id='queued', payload={'text': 'already queued', 'api_turn_v1': {'history': good, 'settings': {}}})
+        handoff = [{'role': 'assistant', 'content': 'summary containing lost input'}]
+        if compaction == 'in_place':
+            owner.db.archive_and_compact(sid, handoff)
+        elif compaction == 'rotation':
+            owner.db.publish_compression_child(parent_session_id=sid, child_session_id='rotated',
+                source='api_server', messages=handoff, require_compression_lease=False)
+        tip = owner.db.get_compression_tip(sid)
+        before = owner.db.get_messages(tip)
+
+        owner.epoch = begin_runtime_epoch(owner.db, instance_id='replacement')
+        assert recover_session_inputs(owner.db, epoch=owner.epoch) == 1
+        assert get_session_admission(owner.db, admission_id=lost['admission_id'])['status'] == 'unknown'
+        assert get_session_admission(owner.db, admission_id=queued['admission_id'])['status'] == 'queued'
+        assert owner.db.get_messages(tip) == before
+
+        continuation = await client.post('/v1/responses', json={'input': 'next'}, headers=headers)
+        assert continuation.status == 200, await continuation.text()
+        assert [text for text, _ in calls] == ['first', 'already queued', 'next']
+        assert [msg['content'] for msg in calls[-1][1]] == ['first', 'answer']
+        assert get_session_admission(owner.db, admission_id=lost['admission_id'])['outcome'] == 'interrupted'
+        assert [msg['content'] for msg in owner.db.get_messages(tip)] == ['first', 'answer']
+
+
+@pytest.mark.asyncio
 async def test_pending_retry_pins_named_conversation_target(api, owner):
     entered, duplicate, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     calls = []

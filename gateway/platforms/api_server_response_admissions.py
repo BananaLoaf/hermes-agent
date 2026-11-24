@@ -120,6 +120,23 @@ def _stored_owner(adapter, session_id):
     return authority.logical_owner(session_id) if authority is not None else session_id
 
 
+async def _recover_interrupted_turn(adapter, session_id):
+    from gateway.session_authorities import active_authority
+    from gateway.session_runtime_workers import tracked_write
+    from hermes_state_runtime_recovery import recover_interrupted_api_turn
+
+    authority = active_authority(adapter.gateway_runner)
+    if authority is None:
+        return False
+
+    def recover():
+        return recover_interrupted_api_turn(
+            authority.db, epoch=authority.epoch, session_id=authority.logical_owner(session_id),
+            guard=authority._admission_gate())
+
+    return await tracked_write(authority, recover, ordered=True)
+
+
 async def _bind_successor(adapter, session_id, run_kwargs):
     """Bind the session a chain moved to before any response starts. A streaming request has
     answered 200 by the time its turn admits, so the bind's retryable ``chain_moved`` refusal must
@@ -209,14 +226,22 @@ async def prepare_context(adapter, request, body, gateway_session_key, durable_k
         from gateway.platforms.api_server_runs import _resolve_live_session_id
         resume_id = stored_session_id if stored_client_session_id == provided_session_id and stored_session_id else provided_session_id
         session_id = await _resolve_live_session_id(adapter, resume_id)
-        if not previous and not history and not body.get('conversation_history') and len(messages) <= 1:
-            history = await adapter._conversation_history_for_session(session_id)
     if durable_key and not provided_session_id and not stored_session_id and not gateway_session_key:
         session_id = 'response-' + hashlib.sha256(f'{scope}\0{key}'.encode()).hexdigest()
     route, overrides, error = adapter._select_request_route(body, session_id=session_id,
         gateway_session_key=gateway_session_key, model_alias=body.get('model'))
     if error is not None:
         return None, error
+    recovered = False
+    if provided_session_id or stored_session_id or declared_selected:
+        recovered = await _recover_interrupted_turn(adapter, session_id)
+    if len(messages) == 1 and not body.get('conversation_history') and (
+            recovered or (provided_session_id and not previous and not history)):
+        from gateway.platforms.api_server_runs import _resolve_live_session_id
+        history_id = await _resolve_live_session_id(adapter, session_id) if recovered else session_id
+        history = await adapter._conversation_history_for_session(history_id)
+        if body.get('truncation') == 'auto':
+            history = _auto_truncate_response_history(history)
     from gateway.platforms.api_server import _request_relay_metadata
     run_kwargs = dict(user_message=user_message, conversation_history=history,
         ephemeral_system_prompt=instructions, session_id=session_id,
