@@ -231,6 +231,9 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
         if row['principal_id'] == 'api' and session['source'] == 'api_server':
             from hermes_state_runtime_recovery import api_turn_checkpoint
             checkpoint = api_turn_checkpoint(db, conn, session_id, mark)
+            # Once another turn claims the transcript, older failed runs can no longer be retried.
+            conn.execute("UPDATE session_admissions SET recovery_checkpoint=NULL WHERE target_session_id=? "
+                         "AND status='terminal' AND recovery_checkpoint IS NOT NULL", (session_id,))
         changed = conn.execute("UPDATE session_admissions SET status='started',owner_epoch=?,generation=?,"
                                "recovery_checkpoint=? WHERE admission_id=? AND status='queued'",
                                (epoch, generation, checkpoint, row['admission_id']))
@@ -267,8 +270,12 @@ def settle_session_input(db, *, epoch: int, admission_id: str, generation: int, 
             conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) '
                          'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                          (RESULT_PREFIX + admission_id, encoded))
-        conn.execute("UPDATE session_admissions SET status='terminal',outcome=?,recovery_checkpoint=NULL "
-                     "WHERE admission_id=?", (outcome, admission_id))
+        turn = (result or {}).get('result') or {}
+        retryable_run = row['request_id'].startswith('run_') and (
+            outcome in ('failed', 'interrupted') or turn.get('failed') or turn.get('error')
+            or turn.get('partial') or turn.get('completed') is False)
+        conn.execute("UPDATE session_admissions SET status='terminal',outcome=?,recovery_checkpoint=? "
+                     "WHERE admission_id=?", (outcome, row['recovery_checkpoint'] if retryable_run else None, admission_id))
         settle_steer_transfers(conn, epoch=epoch, generation=generation, transfers=_transfers, outcome=outcome)
         conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
         return _row(_admission(conn, admission_id))

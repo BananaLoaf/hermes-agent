@@ -3182,7 +3182,14 @@ class APIServerAdapter(OpenAIFilesRoutesMixin, OpenAICompatRoutesMixin, BasePlat
         session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
         if err:
             return err
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        payload = {"object": "hermes.session", "session": self._session_response(session)}
+        if request.query.get('include_latest_run') == 'true':
+            from gateway.platforms.api_server_authority_runs import latest_run
+            run_id = await asyncio.to_thread(latest_run, self, session['id'])
+            if run_id and self._request_owns_run(request, run_id):
+                status = self._durable_run_status(request, run_id) or {}
+                payload['latest_run'] = {key: status[key] for key in ('run_id', 'status', 'error') if key in status}
+        return web.json_response(payload)
 
     @_require_auth
     async def _handle_patch_session(self, request: web.Request) -> web.Response:

@@ -527,7 +527,7 @@ class _RunLaunch:
     session_id: str
     gateway_session_key: Optional[str]
     declared_selected: bool
-    user_message: str
+    user_message: Any
     conversation_history: list[dict[str, str]]
     # #98619: only continuation paths that reload session history may grant wake authority —
     # a previous_response_id continuation consumes its ResponseStore snapshot instead, and a
@@ -541,6 +541,7 @@ class _RunLaunch:
     turn_author: Optional[dict[str, Any]] = None  # memory-attribution label only; grants nothing
     admission: Any = None
     walked_from: Optional[str] = None  # the swept stored session the chain moved past (``bind_api_steps``)
+    input_display: Optional[dict] = None
 
     @property
     def approval_session_key(self) -> str:
@@ -682,7 +683,7 @@ def _run_user_message(raw_input, _openai_error) -> tuple:
 
 async def _admit_run_to_authority(
     self, launch, run_id, session_history_delivery, _declared_selected,
-    idempotency_scope, idempotency_key, _openai_error,
+    idempotency_scope, idempotency_key, _openai_error, *, retry_of=None, retry_text=None,
 ) -> Optional[web.Response]:
     """Admit a /v1/runs turn to the session authority FIFO -> ``None``, or the refusal."""
     from gateway.platforms.api_server_authority_runs import run_admission, store_error_response
@@ -698,6 +699,7 @@ async def _admit_run_to_authority(
                 history_from_session=session_history_delivery,
                 session_history_delivery='1' if session_history_delivery else '',
                 bind_declared_conversation=_declared_selected, walked_from=launch.walked_from,
+                retry_of=retry_of, retry_text=retry_text, input_display=launch.input_display,
                 **launch.agent_kwargs)
     except Exception as exc:  # health: allow BLE001 -- answered below; a committed admission is kept
         # A storage failure after the admission committed (a later media-release write) still
@@ -715,6 +717,48 @@ async def _admit_run_to_authority(
             self._run_idempotency_store.forget(idempotency_scope, idempotency_key)
         return store_error_response(_openai_error, exc)
     return None
+
+
+async def _retry_input(self, request, prior, session_id, _openai_error):
+    from gateway.platforms.api_server_authority_runs import run_admission
+
+    if not isinstance(prior, str) or not prior.startswith('run_') or not isinstance(session_id, str):
+        return None, None, _json_error(_openai_error, 'Invalid run retry', status=400)
+    if self._room_grant_token(request) or not self._request_owns_run(request, prior):
+        return None, None, _run_not_found(_openai_error, prior)
+    owned = await asyncio.to_thread(run_admission, self, prior)
+    if owned is not None:
+        authority, row = owned
+        if row['target_session_id'] == await asyncio.to_thread(authority.logical_owner, session_id):
+            payload = row['payload']
+            text = payload.get('text')
+            data = payload.get('api_turn_v1', {})
+            if isinstance(text, list) and data.get('media'):
+                from gateway.session_api_media import rehydrate_api_images
+                restored = await asyncio.to_thread(rehydrate_api_images, text, data['media'])
+                if sum(isinstance(part, dict) and part.get('type') == 'image_url' for part in restored) < sum(
+                    isinstance(part, dict) and part.get('type') == 'image_url' for part in text
+                ):
+                    return None, None, _json_error(_openai_error, 'A previous image is unavailable', status=410)
+            else:
+                restored = text
+            if restored:
+                return restored, payload, None
+    return None, None, _json_error(_openai_error, 'Run cannot be retried', code='stale_generation', status=409)
+
+
+def _prepare_run_content(content, normalize):
+    from agent.redact import redact_sensitive_text
+    from gateway.platforms.api_server_files import run_file_metadata
+
+    files = run_file_metadata(content)
+    message = normalize(content)
+    caption = '\n'.join(part['text'] for part in content if isinstance(part, dict)
+                        and part.get('type') in ('text', 'input_text') and isinstance(part.get('text'), str))
+    inline_images = sum(isinstance(part, dict) and part.get('type') == 'image_url'
+                        and part['image_url']['url'].startswith('data:') for part in message) if isinstance(message, list) else 0
+    display = {'text': redact_sensitive_text(caption[:16384]), 'files': files, 'inline_images': inline_images}
+    return message, display if files or inline_images else None
 
 
 async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Response:
@@ -742,10 +786,35 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             code="invalid_idempotency_key", status=400)
     idempotency_scope, idempotency_fingerprint = _run_idempotency_identity(
         self, request, body, gateway_session_key, idempotency_key)
+    # A lost-acceptance replay can resolve even if the original inputs have since expired.
+    if idempotency_key:
+        outcome, record = self._run_idempotency_store.lookup(
+            idempotency_scope, idempotency_key, idempotency_fingerprint,
+            retention_until=_room_retention_until(request))
+        if outcome == "conflict" or (outcome == "reused" and record is not None):
+            return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
     raw_input = body.get("input")
-    user_message, input_err = _run_user_message(raw_input, _openai_error)
-    if input_err is not None:
-        return input_err
+    retry_of = body.get('retry_of')
+    retry_text = input_display = None
+    if retry_of is not None:
+        user_message, previous, error = await _retry_input(self, request, retry_of, body.get('session_id'), _openai_error)
+        if error is not None:
+            return error
+        retry_text = previous['text']
+        input_display = previous.get('api_turn_v1', {}).get('input_display')
+        raw_input = None
+    else:
+        user_message, input_err = _run_user_message(raw_input, _openai_error)
+        if input_err is not None:
+            return input_err
+        if isinstance(user_message, list):
+            try:
+                user_message, input_display = await asyncio.to_thread(
+                    _prepare_run_content, user_message, _api_server._normalize_multimodal_content)
+            except ValueError as exc:
+                return _api_server._multimodal_validation_error(exc, param='input')
+            if not user_message:
+                return _json_error(_openai_error, 'No user message found in input', status=400)
     try:
         turn_author = _api_server._request_turn_author(body)
     except ValueError as exc:
@@ -764,14 +833,6 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         requested_provider=agent_overrides.get("requested_provider"), route=route)
     if selection_error:
         return _json_error(_openai_error, selection_error, status=400)
-    # A lost-acceptance replay must resolve even while the original run holds the last
-    # concurrency slot; this read reserves nothing (the atomic reserve below closes the race).
-    if idempotency_key:
-        outcome, record = self._run_idempotency_store.lookup(
-            idempotency_scope, idempotency_key, idempotency_fingerprint,
-            retention_until=_room_retention_until(request))
-        if outcome == "conflict" or (outcome == "reused" and record is not None):
-            return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
     # Enforce concurrency only for a genuinely new run.
     limited = self._concurrency_limited_response()
     if limited is not None:
@@ -828,18 +889,19 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        turn_author=turn_author, walked_from=walked_from if session_id == stored_session_id else None)
+        turn_author=turn_author, walked_from=walked_from if session_id == stored_session_id else None,
+        input_display=input_display)
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
     # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
     # Under session authority the same call admits the turn to the Bot Chat's own FIFO, which is
     # why it is decided BEFORE ``admit_api_turn`` would bind the chat as an API conversation.
-    admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id else None
+    admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id and not (retry_of or input_display) else None
     _retarget_to_delivered_chat(self, launch, admitted)
     if admitted is None and getattr(self.gateway_runner, 'session_authority', None) is not None:
         refused = await _admit_run_to_authority(
             self, launch, run_id, session_history_delivery, _declared_selected,
-            idempotency_scope, idempotency_key, _openai_error)
+            idempotency_scope, idempotency_key, _openai_error, retry_of=retry_of, retry_text=retry_text)
         if refused is not None:
             return refused
     self._activate_admitted_request()
@@ -935,6 +997,8 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             _api_server._publish_turn_process_ownership(agent, effective_task_id)
             # Passed only when set: a human turn keeps today's call shape.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
+            if run.input_display is not None:
+                author_kwargs["persist_user_display_metadata"] = {"api_input": run.input_display}
             r = agent.run_conversation(
                 user_message=run.user_message, conversation_history=run.conversation_history,
                 task_id=effective_task_id, **author_kwargs)
