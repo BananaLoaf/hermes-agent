@@ -297,6 +297,7 @@ DEFAULT_CONFIG = {
     "terminal": {
         "isolation_scope": "default",  # profile: one persistent Docker container per profile
         "docker_container_name": "",
+        "docker_deployment_id": "",
         "docker_mask_source": "",  # Filler file on the Docker daemon host for hidden mounts
         "docker_hidden_files": [],  # In-container file paths covered by the read-only filler
         "backend": "local",

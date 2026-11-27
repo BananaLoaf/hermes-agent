@@ -12,6 +12,7 @@ terminal:
   backend: docker
   isolation_scope: profile
   docker_container_name: prompower-terminal-alice
+  docker_deployment_id: prompower
   container_persistent: true
   docker_persist_across_processes: true
   docker_image: nousresearch/hermes-sandbox:desktop
@@ -23,10 +24,10 @@ terminal:
 ```
 
 `docker_container_name` is the exact Docker container name. Set a unique name for each
-profile and deployment in your configuration template. Hermes validates Docker name syntax
-but does not normalize or append anything to the name. Ownership labels based on the name
-and canonical profile home, plus a material-configuration digest, are checked before reuse.
-A foreign container occupying the name is never removed automatically.
+profile and deployment in your configuration template. `docker_deployment_id` identifies the
+installation on the Docker host. Use the same stable ID across that installation's profiles
+and give each installation its own ID. Hermes checks the deployment label, profile ownership
+and material configuration before reuse.
 
 Chats, subagents and prompt probes reuse the profile container, including after a gateway
 restart. A filesystem lock serializes first use across processes sharing the profile home.

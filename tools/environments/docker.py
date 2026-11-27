@@ -211,8 +211,10 @@ def reap_orphan_containers(
         age = (now - finished_at).total_seconds()
         if age < max_age_seconds:
             continue
+        if _is_profile_container(docker, cid):
+            continue
         strip_sandbox_privileges(docker, cid)  # its teardown never ran; owners stay (it may restart)
-        if _is_idle_workspace_container(docker, cid) or _is_profile_container(docker, cid):
+        if _is_idle_workspace_container(docker, cid):
             continue
         # No -f: a sibling may have restarted the container between the ps snapshot
         # and now (FinishedAt still reports the previous exit), and the daemon refuses

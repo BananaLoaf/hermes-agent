@@ -46,6 +46,7 @@ def apply_profile_labels(environment, image, resources, user_args, extra, *, req
     digest = hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
     environment._labels.update({
         'hermes-profile': scope['profile'],
+        'hermes-terminal-deployment': scope['deployment'],
         'hermes-terminal-scope': 'profile', 'hermes-terminal-owner': scope['identity'],
         'hermes-terminal-config-hash': digest,
     })

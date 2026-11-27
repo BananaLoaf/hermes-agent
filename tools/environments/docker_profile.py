@@ -27,8 +27,11 @@ def profile_scope() -> dict | None:
     name = terminal_env('TERMINAL_DOCKER_CONTAINER_NAME')
     if not name or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]*', name):
         raise ValueError('Profile Docker scope requires a valid docker_container_name')
-    identity = hashlib.sha256(f'{name}\0{home}'.encode()).hexdigest()[:16]
-    return dict(profile=profile, profile_home=str(home), name=name,
+    deployment = terminal_env('TERMINAL_DOCKER_DEPLOYMENT_ID', '').strip()
+    if not deployment:
+        raise ValueError('Profile Docker scope requires docker_deployment_id')
+    identity = hashlib.sha256(f'{deployment}\0{name}\0{home}'.encode()).hexdigest()[:16]
+    return dict(profile=profile, profile_home=str(home), name=name, deployment=deployment,
                 identity=identity,
                 mask_source=terminal_env('TERMINAL_DOCKER_MASK_SOURCE', ''),
                 hidden_files=json.loads(terminal_env('TERMINAL_DOCKER_HIDDEN_FILES', '[]')))
@@ -89,12 +92,16 @@ def connect(environment, task_label, profile_name, egress_label, network):
             current = json.loads(probe.stdout)[0]
             labels = current.get('Config', {}).get('Labels') or {}
             owned = all(labels.get(k) == environment._labels[k] for k in
-                        ('hermes-profile', 'hermes-terminal-scope', 'hermes-terminal-owner'))
+                        ('hermes-profile', 'hermes-terminal-scope', 'hermes-terminal-owner',
+                         'hermes-terminal-deployment'))
             if not owned:
                 raise RuntimeError('Profile Docker name belongs to another owner; refusing to replace it')
             if labels.get('hermes-terminal-config-hash') == environment._labels['hermes-terminal-config-hash']:
                 if not current.get('State', {}).get('Running'):
-                    run_capture([environment._docker_exe, 'start', current['Id']], timeout=30, check=True)
+                    started = run_capture([environment._docker_exe, 'start', current['Id']], timeout=30)
+                    if started.returncode:
+                        detail = started.stderr.strip() or started.stdout.strip() or f'exit code {started.returncode}'
+                        raise RuntimeError(f"Cannot start profile Docker container {scope['name']}: {detail}")
                 environment._container_id = current['Id']
                 return True
             if not environment._image_available_locally():

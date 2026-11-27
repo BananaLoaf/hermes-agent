@@ -26,6 +26,7 @@ def profiles(tmp_path, monkeypatch):
         home.mkdir(parents=True)
         (home / 'config.yaml').write_text(json.dumps({'terminal': {
             'backend': 'docker', 'isolation_scope': 'profile', 'docker_container_name': f'client-one-{name}-terminal',
+            'docker_deployment_id': 'client-one',
             'cwd': '/workspace', 'container_persistent': True,
         }}))
         homes.append(home)
@@ -129,6 +130,7 @@ def test_profile_reuse_restart_configuration_and_foreign_ownership(profiles, dae
     assert replacement._profile_scope['name'] == 'client-one-alice-terminal'
     assert labels['hermes-profile'] == 'alice'
     assert labels['hermes-terminal-scope'] == 'profile'
+    assert labels['hermes-terminal-deployment'] == 'client-one'
     scope_name = replacement._profile_scope['name']
     daemon.containers[scope_name]['State']['Running'] = False
     assert environment(alice, image='image-two')._container_id == replacement._container_id
@@ -136,6 +138,39 @@ def test_profile_reuse_restart_configuration_and_foreign_ownership(profiles, dae
     with pytest.raises(RuntimeError, match='another owner'):
         environment(alice)
     assert scope_name in daemon.containers
+
+
+def test_same_container_name_cannot_cross_deployments(profiles, daemon):
+    profile = profiles[0]
+    first = environment(profile)
+    config_path = profile / 'config.yaml'
+    config = json.loads(config_path.read_text())
+    config['terminal']['docker_deployment_id'] = 'client-two'
+    config_path.write_text(json.dumps(config))
+
+    with pytest.raises(RuntimeError, match='another owner'):
+        environment(profile, image='image-two')
+
+    assert daemon.containers[first._profile_scope['name']]['Id'] == first._container_id
+    assert not any(call[1] == 'rm' for call in daemon.calls)
+
+
+def test_profile_restart_reports_docker_error(profiles, daemon, monkeypatch):
+    from tools.environments import remote_common
+
+    first = environment(profiles[0])
+    name = first._profile_scope['name']
+    daemon.containers[name]['State']['Running'] = False
+
+    def failed_start(args, **kwargs):
+        if args[1] == 'start':
+            return subprocess.CompletedProcess(args, 1, '', 'network namespace is unavailable\n')
+        return daemon(args, **kwargs)
+
+    monkeypatch.setattr(remote_common, 'run_capture', failed_start)
+    with pytest.raises(RuntimeError, match=f'{name}: network namespace is unavailable'):
+        environment(profiles[0])
+    assert daemon.containers[name]['Id'] == first._container_id
 
 
 def test_simultaneous_first_use_creates_only_one_container(profiles, daemon):
