@@ -299,8 +299,6 @@ DEFAULT_CONFIG = {
         "docker_container_name": "",
         "docker_mask_source": "",  # Filler file on the Docker daemon host for hidden mounts
         "docker_hidden_files": [],  # In-container file paths covered by the read-only filler
-        "docker_profiles_root": "",
-        "docker_allowed_profile_sources": [],
         "backend": "local",
         "modal_mode": "auto",
         # Remote-backend connection-class failures (SSH host unreachable, Docker daemon down):

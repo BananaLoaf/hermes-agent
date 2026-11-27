@@ -717,7 +717,7 @@ class DockerEnvironment(BaseEnvironment):
 
         _ensure_docker_available()
         from tools.environments.docker_profile_runtime import prepare_mounts
-        volumes = prepare_mounts(self, volumes, image, extra_args)
+        volumes = prepare_mounts(self, volumes, extra_args)
 
         resource_args = self._resource_args(image, cpu, memory, disk, network, shm_size, extra_args)
         volume_args, writable_args = self._mount_args(volumes, host_cwd, auto_mount_cwd, task_id)
@@ -728,9 +728,8 @@ class DockerEnvironment(BaseEnvironment):
                 mount, cwd)
             cwd = mount
             self.cwd = mount
-        volume_args.extend(_readonly_skill_mount_args())
-        from tools.environments.docker_profile_runtime import validate_automatic_aliases
-        validate_automatic_aliases(self, volume_args)
+        if not self._profile_scope:
+            volume_args.extend(_readonly_skill_mount_args())
         egress_label, egress_volume_args, egress_host_args, env_args, validated_extra = (
             self._egress_and_env_args(extra_args))
         volume_args.extend(egress_volume_args)
@@ -883,6 +882,8 @@ class DockerEnvironment(BaseEnvironment):
         from tools.environments.docker_profile_runtime import append_mount_arg, claims_target
         for vol in volumes or []:
             append_mount_arg(volume_args, vol)
+        if self._profile_scope:
+            return volume_args, []
         workspace_explicitly_mounted = claims_target(volume_args, "/workspace")
 
         host_cwd_abs = _abs_host_cwd(host_cwd) if host_cwd else ""
@@ -918,10 +919,9 @@ class DockerEnvironment(BaseEnvironment):
             # _sandbox_dir_name(): a raw session-key task_id carries colons,
             # which `-v` reads as extra spec fields (exit 125).
             sandbox = get_sandbox_dir() / "docker" / _sandbox_dir_name(task_id)
-            if not (self._profile_scope and claims_target(volume_args, "/root")):
-                self._home_dir = str(sandbox / "home")
-                os.makedirs(self._home_dir, exist_ok=True)
-                self._sandbox_mounts = [(self._home_dir, "/root")]
+            self._home_dir = str(sandbox / "home")
+            os.makedirs(self._home_dir, exist_ok=True)
+            self._sandbox_mounts = [(self._home_dir, "/root")]
             if mount_workspace:
                 self._workspace_dir = str(sandbox / "workspace")
                 os.makedirs(self._workspace_dir, exist_ok=True)

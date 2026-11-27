@@ -27,13 +27,10 @@ def profile_scope() -> dict | None:
     name = terminal_env('TERMINAL_DOCKER_CONTAINER_NAME')
     if not name or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]*', name):
         raise ValueError('Profile Docker scope requires a valid docker_container_name')
-    allowed = json.loads(terminal_env('TERMINAL_DOCKER_ALLOWED_PROFILE_SOURCES', '[]'))
-    if not isinstance(allowed, list) or any(not isinstance(path, str) for path in allowed):
-        raise ValueError('docker_allowed_profile_sources must be a list of paths')
     identity = hashlib.sha256(f'{name}\0{home}'.encode()).hexdigest()[:16]
     return dict(profile=profile, profile_home=str(home), name=name,
-                identity=identity, profiles_root=terminal_env('TERMINAL_DOCKER_PROFILES_ROOT') or str(home / 'profiles' if home.parent.name != 'profiles' else home.parent),
-                allowed_sources=allowed, mask_source=terminal_env('TERMINAL_DOCKER_MASK_SOURCE', ''),
+                identity=identity,
+                mask_source=terminal_env('TERMINAL_DOCKER_MASK_SOURCE', ''),
                 hidden_files=json.loads(terminal_env('TERMINAL_DOCKER_HIDDEN_FILES', '[]')))
 
 

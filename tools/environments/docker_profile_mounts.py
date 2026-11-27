@@ -1,13 +1,9 @@
 """Structured Docker bind mounts, resolved only inside the owning profile scope."""
 from __future__ import annotations
 
-import os
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 import posixpath
 import string
-import shlex
-
-OMITTED = 'File contents omitted for security\n'
 
 
 def expand(value: str, context: dict) -> str:
@@ -54,29 +50,11 @@ def normalize_mounts(volumes: list, scope: dict) -> list[dict]:
         if target == '/' or target in targets:
             raise ValueError('Docker mount targets must be unique and cannot replace /')
         targets.add(target)
-        _check_profile_source(source, scope, context, hidden)
         mounts.append(dict(source=source, target=target, read_only=read_only, hidden=hidden))
     # Parent mounts must exist before their file masks, independent of YAML order.
     mounts.sort(key=lambda m: (m['hidden'], len(PurePosixPath(m['target']).parts)))
     _check_masks(mounts)
     return mounts
-
-
-def _check_profile_source(source, scope, context, hidden):
-    roots = [scope.get('profiles_root', '')]
-    path = PurePosixPath(source)
-    if 'profiles' in path.parts:
-        roots.append(str(PurePosixPath(*path.parts[:path.parts.index('profiles') + 1])))
-    allowed = any(path.is_relative_to(_path(p, context)) for p in scope.get('allowed_sources', []))
-    for root in filter(None, roots):
-        root = PurePosixPath(root)
-        if not hidden and path == root:
-            raise ValueError('Mount individual profiles, not the profiles root')
-        if not hidden and root.is_relative_to(path) and not allowed:
-            raise ValueError('A source containing private profiles needs administrator approval')
-        if not hidden and path.is_relative_to(root) and path != root:
-            if path.relative_to(root).parts[0] != scope['profile'] and not allowed:
-                raise ValueError('Another profile source needs docker_allowed_profile_sources approval')
 
 
 def _check_masks(mounts: list[dict]) -> None:
@@ -86,9 +64,8 @@ def _check_masks(mounts: list[dict]) -> None:
         if not parents:
             raise ValueError('A hidden file must mask a file inside an explicit directory mount')
         parent = max(parents, key=lambda m: len(m['target']))
-        original = PurePosixPath(parent['source']) / PurePosixPath(mask['target']).relative_to(parent['target'])
-        mask['parent_source'] = parent['source']
-        mask['relative_target'] = str(PurePosixPath(mask['target']).relative_to(parent['target']))
+        relative = PurePosixPath(mask['target']).relative_to(parent['target'])
+        original = PurePosixPath(parent['source']) / relative
         for other in mounts:
             source = PurePosixPath(other['source'])
             if not other['hidden'] and original.is_relative_to(source):
@@ -99,73 +76,5 @@ def _check_masks(mounts: list[dict]) -> None:
                 raise ValueError('The hidden-file filler cannot also be exposed through a writable mount')
 
 
-def bind_spec(mount: dict, target: str | None = None) -> str:
-    return f"type=bind,source={mount['source']},target={target or mount['target']}" + (',readonly' if mount['read_only'] else '')
-
-
-# Only filler bytes are read; protected originals are inspected for type/link metadata.
-def validation_script(mounts: list[dict], uid: int, gids: list[int], prefix: str = '') -> str:
-    q = shlex.quote
-    lines = [
-        'set -euo pipefail',
-        f'uid={uid}', f'gids={q(" ".join(map(str, gids)))}',
-        'fail() { printf "%s\\n" "$1" >&2; exit 1; }',
-        'metadata() { read -r permissions links owner group rest < <(LC_ALL=C ls -Lldn -- "$1") || fail "Cannot inspect bind metadata"; }',
-        'protected() { metadata "$1"; [[ "$uid" != 0 && "$owner" != "$uid" && "$permissions" != *+ && "${permissions:8:1}" != w ]] '
-        '&& { [[ "${permissions:5:1}" != w ]] || [[ " $gids " != *" $group "* ]]; }; }',
-    ]
-    for index, mount in enumerate(mounts):
-        path = f'{prefix}/inputs/{index}'
-        lines.append(f'[[ -f {q(path)} || -d {q(path)} ]] || fail "Bind source must be a file or directory"')
-        if not mount['hidden']:
-            continue
-        parent = f'{prefix}/parents/{index}'
-        lines.extend([
-            f'[[ -f {q(path)} ]] || fail "Hidden filler must be a regular file"',
-            f'protected {q(path)} || fail "Hidden filler must be administrator-owned and non-writable"',
-            '[[ "$permissions" != *w* ]] || fail "Hidden filler has write permission bits"',
-            f"printf '%s\\n' 'File contents omitted for security' | cmp -s - {q(path)} || fail 'Invalid hidden filler contents'",
-            f'protected {q(parent)} || fail "Hidden filler parent is writable"',
-            f'[[ ! -L {q(parent + "/" + Path(mount["source"]).name)} ]] || fail "Hidden filler cannot be a symlink"',
-        ])
-        for number in range(mount.get('ancestor_count', 0)):
-            lines.append(f'protected {q(f"{prefix}/ancestors/{index}/{number}")} || fail "Hidden filler ancestor is writable"')
-        base = f'{prefix}/originals/{index}'
-        for part in mount['relative_target'].split('/'):
-            base += '/' + part
-            lines.append(f'[[ ! -L {q(base)} ]] || fail "Hidden target cannot traverse symlinks"')
-        lines.extend([
-            f'[[ -f {q(base)} ]] || fail "Hidden target must be a regular file"',
-            f'metadata {q(base)}',
-            '[[ "$links" == 1 ]] || fail "Hidden target has hard-link aliases"',
-        ])
-    return '\n'.join([*lines, "printf 'validated\\n'"])
-
-
-def validate_daemon_sources(docker: str, image: str, mounts: list[dict], run) -> None:
-    if not mounts:
-        return
-    argv = [docker, 'run', '--rm', '--network=none', '--read-only', '--cap-drop=ALL']
-    validation_mounts = [dict(m) for m in mounts]
-    for index, mount in enumerate(validation_mounts):
-        argv += ['--mount', bind_spec(dict(mount, read_only=True), f'/inputs/{index}')]
-        if mount['hidden']:
-            for source, target in ((str(PurePosixPath(mount['source']).parent), f'/parents/{index}'),
-                                   (mount['parent_source'], f'/originals/{index}')):
-                argv += ['--mount', bind_spec(dict(source=source, target=target, read_only=True))]
-            ancestors = list(Path(mount['source']).parents)
-            mount['ancestor_count'] = len(ancestors)
-            for number, parent in enumerate(ancestors):
-                argv += ['--mount', bind_spec(dict(source=str(parent), target=f'/ancestors/{index}/{number}', read_only=True))]
-    uid = os.geteuid() if hasattr(os, 'geteuid') else -1
-    gids = list(os.getgroups()) if hasattr(os, 'getgroups') else []
-    if any(m['hidden'] for m in mounts) and uid < 0:
-        raise ValueError('Hidden file mounts require a POSIX runtime identity')
-    if uid >= 0 and hasattr(os, 'getegid'):
-        argv += ['--user', f'{uid}:{os.getegid()}']  # windows-footgun: ok — guarded by hasattr above
-        for gid in gids:
-            argv += ['--group-add', str(gid)]
-    argv += ['--entrypoint', 'bash', image, '-c', validation_script(validation_mounts, uid, gids)]
-    result = run(argv, timeout=120)
-    if result.returncode or result.stdout.strip() != 'validated':
-        raise ValueError('Docker bind-source validation failed: ' + result.stderr.strip())
+def bind_spec(mount: dict) -> str:
+    return f"type=bind,source={mount['source']},target={mount['target']}" + (',readonly' if mount['read_only'] else '')

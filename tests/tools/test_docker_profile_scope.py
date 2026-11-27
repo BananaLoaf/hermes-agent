@@ -2,7 +2,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import json
-import os
 from pathlib import Path
 import subprocess
 import threading
@@ -13,8 +12,7 @@ from hermes_constants import set_hermes_home_override, reset_hermes_home_overrid
 from tools.terminal_scope import install_and_reset_profile_terminal_scope
 from tools.environments import docker as docker_env
 from tools.environments.docker_profile import profile_scope
-from tools.environments.docker_profile_mounts import normalize_mounts, validation_script
-
+from tools.environments.docker_profile_mounts import normalize_mounts
 
 @pytest.fixture
 def profiles(tmp_path, monkeypatch):
@@ -101,7 +99,6 @@ def daemon(monkeypatch):
     monkeypatch.setattr(remote_common, 'run_capture', daemon)
     monkeypatch.setattr(docker_env, 'run_capture', daemon)
     monkeypatch.setattr(docker_env, '_ensure_docker_available', lambda: None)
-    monkeypatch.setattr(docker_env, '_readonly_skill_mount_args', list)
     monkeypatch.setattr(docker_env, '_image_uses_init_entrypoint', lambda *args: False)
     monkeypatch.setattr(docker_env, 'find_docker', lambda: 'docker')
     for name in ('strip_sandbox_privileges', 'reclaim_sandbox_files'):
@@ -174,17 +171,10 @@ def test_sessions_subagents_and_profile_mounts_use_separate_keys(profiles):
         terminal._task_env_overrides.update(before)
 
 
-def test_mount_placeholders_and_foreign_allowlist(profiles):
+def test_mount_placeholders_and_explicit_sources(profiles):
     with selected(profiles[0]) as scope:
         own = dict(source='/host/client-one/profiles/{profile}/workspace', target='/workspace', read_only=False)
         assert normalize_mounts([own], scope)[0]['source'] == '/host/client-one/profiles/alice/workspace'
-        foreign = dict(source='/host/client-one/profiles/bob/workspace', target='/bob', read_only=True)
-        with pytest.raises(ValueError, match='approval'):
-            normalize_mounts([own, foreign], scope)
-        with pytest.raises(ValueError, match='approval'):
-            normalize_mounts([{'source': '/', 'target': '/host'}], scope)
-        allowed = scope | {'allowed_sources': ['/host/client-one/profiles/bob/workspace']}
-        assert normalize_mounts([own, foreign], allowed)[1]['read_only']
         for invalid in [own | {'source': '/host/{unknown}'}, own | {'target': '/workspace/../secret'}]:
             with pytest.raises(ValueError):
                 normalize_mounts([invalid], scope)
@@ -198,6 +188,8 @@ def test_hidden_masks_are_ordered_and_cannot_have_unmasked_mount_aliases(profile
         scope |= {'mask_source': '/admin/filler', 'hidden_files': ['/profile/config.yaml']}
         mounts = normalize_mounts([parent], scope)
         assert mounts[-1]['hidden'] and mounts[-1]['read_only']
+        with pytest.raises(ValueError, match='explicit directory mount'):
+            normalize_mounts([], scope)
         with pytest.raises(ValueError, match='second mount'):
             normalize_mounts([parent, parent | {'target': '/alternate'}], scope)
         with pytest.raises(ValueError, match='Invalid structured'):
@@ -220,41 +212,6 @@ def test_mask_source_setting_is_profile_scoped(profiles):
                           {'target': '/data', 'source': ''}, {'target': '/data', 'source': None}):
                 with pytest.raises(ValueError, match='explicit source'):
                     normalize_mounts([entry], scope | {'hidden_files': []})
-
-
-@pytest.mark.platforms("posix")
-def test_hidden_filler_validation_checks_bytes_permissions_and_original_links(tmp_path):
-    uid = os.geteuid() if hasattr(os, 'geteuid') else 1000
-    profile = tmp_path / 'profile'
-    profile.mkdir()
-    original = profile / 'config.yaml'
-    original.write_text('private')
-    filler = tmp_path / 'admin' / 'filler'
-    filler.parent.mkdir(mode=0o755)
-    filler.write_text('File contents omitted for security\n')
-    filler.chmod(0o444)
-    for group in ('inputs', 'parents', 'originals'):
-        (tmp_path / group).mkdir()
-    (tmp_path / 'inputs/0').symlink_to(profile, target_is_directory=True)
-    (tmp_path / 'inputs/1').symlink_to(filler)
-    (tmp_path / 'parents/1').symlink_to(filler.parent, target_is_directory=True)
-    (tmp_path / 'originals/1').symlink_to(profile, target_is_directory=True)
-    mounts = [dict(hidden=False), dict(hidden=True, relative_target='config.yaml', source=str(filler))]
-    def validate(runtime_uid=uid + 1):
-        return subprocess.run(['bash', '-c', validation_script(mounts, runtime_uid, [], str(tmp_path))],
-                              capture_output=True, text=True, check=False)
-    assert validate().returncode == 0
-    assert validate(uid).returncode != 0
-    filler.chmod(0o644)
-    assert validate().returncode != 0
-    filler.write_text('wrong text\n')
-    filler.chmod(0o444)
-    assert validate().returncode != 0
-    filler.chmod(0o644)
-    filler.write_text('File contents omitted for security\n')
-    filler.chmod(0o444)
-    os.link(original, profile / 'alias')
-    assert validate().returncode != 0
 
 
 def test_live_mount_change_evicts_only_own_native_environment(profiles, monkeypatch):
@@ -308,7 +265,9 @@ def test_structured_mounts_keep_command_guard_host_access_checks():
 
 
 def test_prompt_probe_and_idle_reaping_keep_the_profile_container(profiles, daemon):
+    from tools import terminal_tool
     from tools.terminal_tool_backends import _create_environment
+    from tools.terminal_tool_lifecycle import _cleanup_inactive_envs
     first = environment(profiles[0])
     identity = first._container_id
     with selected(profiles[0]) as scope:
@@ -320,37 +279,64 @@ def test_prompt_probe_and_idle_reaping_keep_the_profile_container(profiles, daem
         probe.cleanup(force_remove=True)
         assert probe.wait_for_cleanup(timeout=5)
     assert len(daemon.containers) == 1
-    first.stop_idle()
-    assert first.wait_for_cleanup(timeout=5)
-    assert not next(iter(daemon.containers.values()))['State']['Running']
+    terminal_tool._active_environments[first._task_id] = first
+    terminal_tool._last_activity[first._task_id] = 0
+    _cleanup_inactive_envs()
+    assert first._task_id not in terminal_tool._active_environments
+    assert next(iter(daemon.containers.values()))['State']['Running']
+    assert not any(call[1] == 'stop' for call in daemon.calls)
+    daemon(['docker', 'stop', identity])
     assert docker_env.reap_orphan_containers(max_age_seconds=0, docker_exe='docker') == 0
     assert environment(profiles[0])._container_id == identity
 
 
-def test_bind_source_validation_is_done_by_daemon_without_auto_creation(profiles):
-    from tools.environments.docker_profile_mounts import validate_daemon_sources
-    calls = []
-    def missing(args, **kwargs):
-        calls.append(args)
-        return subprocess.CompletedProcess(args, 125, '', 'bind source does not exist')
-    mounts = [{'source': '/missing/host/path', 'target': '/workspace', 'hidden': False, 'read_only': False}]
-    with pytest.raises(ValueError, match='does not exist'):
-        validate_daemon_sources('docker', 'image', mounts, missing)
-    assert '--mount' in calls[0] and '-v' not in calls[0]
-    assert 'type=bind,source=/missing/host/path,target=/inputs/0,readonly' in calls[0]
-
-
-@pytest.mark.parametrize('target', ['/profile/config.yaml', '/root/.hermes/config.yaml'])
-def test_native_credential_mount_cannot_override_or_bypass_hidden_file(profiles, target):
-    from types import SimpleNamespace
-    from tools.environments.docker_profile_runtime import validate_automatic_aliases
+@pytest.mark.parametrize('explicit_home', [False, True])
+def test_profile_uses_configured_mounts_only(profiles, daemon, explicit_home):
+    home = '/opt/data/profiles/alice'
+    workspace = f'{home}/workspace'
     with selected(profiles[0]) as scope:
-        mounts = normalize_mounts([
-            {'source': '/host/profiles/alice', 'target': '/profile'},
-        ], scope | {'mask_source': '/admin/filler', 'hidden_files': ['/profile/config.yaml']})
-        env = SimpleNamespace(_profile_scope=scope, _profile_mounts=mounts)
-        with pytest.raises(ValueError):
-            validate_automatic_aliases(env, ['-v', f'/host/profiles/alice/config.yaml:{target}:ro'])
+        env = docker_env.DockerEnvironment(
+            image='image-one', cwd=workspace, profile_scope=scope, persistent_filesystem=True,
+            env={'HOME': home} if explicit_home else None,
+            volumes=[dict(source='/host/profiles/alice/workspace', target=workspace)],
+            extra_args=['--network=container:client-one-vpn'],
+        )
+    actual = next(args for args in daemon.calls if args[1] == 'run' and '-d' in args)
+    if explicit_home:
+        assert 'HOME' in actual
+    assert env._home_dir is None
+    assert not any('target=/root' in arg for arg in actual)
+    assert env._workspace_dir is None
+    assert f'type=bind,source=/host/profiles/alice/workspace,target={workspace}' in actual
+    assert not any('target=/workspace' in arg for arg in actual)
+    assert '--read-only' not in actual
+    assert '--network=container:client-one-vpn' in actual
+    assert '--network=none' not in actual
+
+
+def test_profile_uses_only_configured_binds_and_masks(profiles, daemon, monkeypatch):
+    from tools import credential_files
+
+    profile = profiles[0]
+    target = str(profile)
+    mounts = [dict(source='/host/alice', target=target, read_only=True)]
+
+    def unexpected_mounts():
+        pytest.fail('Profile Docker uses explicit mounts')
+
+    monkeypatch.setattr(docker_env, '_readonly_skill_mount_args', unexpected_mounts)
+    with selected(profile) as scope:
+        scope.update(mask_source='/admin/filler', hidden_files=[f'{target}/auth.json'])
+        docker_env.DockerEnvironment(image='image-one', cwd=target, profile_scope=scope,
+                                     persistent_filesystem=True, volumes=mounts)
+        attachment = str(profile / 'attachments' / 'one.pdf')
+        assert credential_files.to_agent_visible_cache_path(attachment) == attachment
+        assert credential_files.from_agent_visible_cache_path(attachment) == attachment
+
+    creates = [args for args in daemon.calls if args[1] == 'run' and '--mount' in args]
+    assert len(creates) == 1 and '-d' in creates[0]
+    assert f'type=bind,source=/host/alice,target={target},readonly' in creates[0]
+    assert f'type=bind,source=/admin/filler,target={target}/auth.json,readonly' in creates[0]
 
 
 def test_resource_setting_change_replaces_only_its_profile(profiles, daemon, monkeypatch):

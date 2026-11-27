@@ -144,7 +144,11 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     for task_id, env in envs_to_stop:
         if env is not None:
             _clear_file_ops_cache(task_id)
-            if (_is_workspace_key(task_id) or getattr(env, "_profile_scope", None)) and callable(getattr(env, "stop_idle", None)):
+            if getattr(env, "_profile_scope", None):
+                # Another gateway or a new turn can already be using this same
+                # container. Idle eviction releases only this process's cache.
+                continue
+            if _is_workspace_key(task_id) and callable(getattr(env, "stop_idle", None)):
                 # Persistent per-workspace container: stop it (state kept, restarted on next use)
                 # instead of leaving it running forever like the one profile container.
                 _teardown_env(env, task_id, stop_idle=True)

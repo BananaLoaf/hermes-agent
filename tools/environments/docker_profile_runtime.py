@@ -2,13 +2,12 @@
 import hashlib
 import json
 import logging
-
-from .docker_profile_mounts import bind_spec, normalize_mounts, validate_daemon_sources
+from .docker_profile_mounts import bind_spec, normalize_mounts
 
 logger = logging.getLogger(__name__)
 
 
-def prepare_mounts(environment, volumes, image, extra_args):
+def prepare_mounts(environment, volumes, extra_args):
     scope = environment._profile_scope
     structured = any(isinstance(m, dict) for m in volumes or [])
     if not scope and not structured:
@@ -22,9 +21,6 @@ def prepare_mounts(environment, volumes, image, extra_args):
     if environment._persistent is not True or environment._persist_across_processes is not True:
         raise ValueError('Profile Docker scope requires persistent filesystem and cross-process reuse')
     mounts = normalize_mounts(volumes or [], scope)
-    from .docker import find_docker
-    from .remote_common import run_capture
-    validate_daemon_sources(find_docker() or 'docker', image, mounts, run_capture)
     environment._profile_mounts = mounts
     return mounts
 
@@ -53,24 +49,6 @@ def apply_profile_labels(environment, image, resources, user_args, extra, *, req
         'hermes-terminal-scope': 'profile', 'hermes-terminal-owner': scope['identity'],
         'hermes-terminal-config-hash': digest,
     })
-
-
-def validate_automatic_aliases(environment, args):
-    """A native credential/cache mount must not re-expose an explicitly masked file."""
-    if not environment._profile_scope:
-        return
-    from .docker import _split_volume_spec
-    from .docker_profile_mounts import _check_masks
-    from pathlib import PurePosixPath
-    mounts = environment._profile_mounts
-    declared = {m['target'] for m in mounts}
-    extras = []
-    for index, arg in enumerate(args[:-1]):
-        if arg == '-v' and (parts := _split_volume_spec(args[index + 1])):
-            if parts[1] in declared or any(m['hidden'] and PurePosixPath(m['target']).is_relative_to(parts[1]) for m in mounts):
-                raise ValueError('Automatic Docker mount conflicts with an explicit or hidden target')
-            extras.append(dict(source=parts[0], target=parts[1], read_only=args[index + 1].endswith(':ro'), hidden=False))
-    _check_masks([*mounts, *extras])
 
 
 def claims_target(args: list[str], target: str) -> bool:

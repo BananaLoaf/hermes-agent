@@ -16,7 +16,6 @@ terminal:
   docker_persist_across_processes: true
   docker_image: nousresearch/hermes-sandbox:desktop
   cwd: /workspace
-  docker_profiles_root: /opt/docker-volumes/prompower/hermes/profiles
   docker_volumes:
     - source: /opt/docker-volumes/prompower/hermes/profiles/{profile}/workspace
       target: /workspace
@@ -33,8 +32,9 @@ Chats, subagents and prompt probes reuse the profile container, including after 
 restart. A filesystem lock serializes first use across processes sharing the profile home.
 Changing image, mounts, network, resource limits or other material Docker settings replaces
 only that profile's container. Images are checked before an existing container is removed.
-Idle cleanup stops the container without deleting its filesystem; the orphan reaper preserves
-profile containers so the next use can restart them. An explicit force teardown may remove it.
+Idle cleanup releases the cached gateway handle. The container stays available to other
+sessions and processes. The orphan reaper preserves it, and an explicit force teardown may
+remove it.
 
 The default `isolation_scope: default` retains existing session/workspace behavior. Profile
 scope requires persistence and cannot be combined with `docker_shared_container_key` or
@@ -49,33 +49,16 @@ translated to a host-daemon path. Sources must be absolute paths on the **Docker
 Targets must be absolute Linux paths; traversal, unknown placeholders, duplicate targets and
 Docker-option separators in structured paths are refused.
 
-Sources are checked through the daemon with strict `--mount`, which refuses a missing source
-instead of creating an empty directory. The short-lived checker uses the configured image's
-Bash and ordinary Unix utilities; it does not require Python in the sandbox image. The complete
-mount list is profile-scoped and is never copied into another profile's process environment.
-
-A path under another `profiles/<name>` directory requires explicit administrator approval:
-
-```yaml
-terminal:
-  docker_allowed_profile_sources:
-    - /opt/docker-volumes/prompower/hermes/profiles/bob/workspace
-  docker_volumes:
-    - source: /opt/docker-volumes/prompower/hermes/profiles/alice/workspace
-      target: /workspace
-    - source: /opt/docker-volumes/prompower/hermes/profiles/bob/workspace
-      target: /colleagues/bob
-      read_only: true
-```
-
-Allowlists are exact source roots and their descendants, not profile names or wildcard patterns.
-Mounting the profiles root itself is refused. Docker mount/name/label overrides in
-`docker_extra_args` are refused in profile mode; declare mounts through `docker_volumes`.
+In profile mode, Docker uses the bind mounts declared in `docker_volumes`. Mount paths for
+skills, caches, and attachments should match the paths used by the Hermes process if the
+terminal needs to access them. Set `docker_env.HOME` if the shell should use the mounted
+profile path as its home directory. Provide bind mounts through `docker_volumes`, not
+`docker_extra_args`.
 
 ## Hidden files
 
-For an explicitly mounted profile directory, a hidden mount can cover an existing sensitive
-file with an administrator-managed filler:
+Hidden mounts use an administrator-managed filler. Set hidden paths inside an explicit
+directory mount:
 
 ```yaml
 terminal:
@@ -83,6 +66,7 @@ terminal:
   docker_volumes:
     - source: /opt/docker-volumes/prompower/hermes/profiles/{profile}
       target: /profile
+      read_only: true
   docker_hidden_files:
     - /profile/config.yaml
 ```
@@ -91,17 +75,8 @@ terminal:
 for every path in `docker_hidden_files`. These masks are always read-only. Ordinary
 `docker_volumes` entries require `source` and do not accept a `hidden` field.
 
-The filler must contain exactly `File contents omitted for security` followed by a newline.
-It and its parent hierarchy must be administrator-owned and non-writable by the Hermes runtime;
-use a non-root runtime and a protected directory such as `/etc/hermes`. The filler itself must
-have no write permission bits. The terminal receives the file read-only. Checks run through
-the host daemon, so the source does not have to exist at the same path in the parent container.
-
-The mask is applied after its directory mount regardless of YAML ordering. Hidden targets must
-be regular files with no hard-link aliases, and their path must not traverse a symlink. Extra
-mounts, including native credential/cache mounts, cannot expose the original under an unmasked
-alias. The underlying sensitive file is inspected for metadata only, never read or copied into
-the terminal container before the mask is applied.
+The filler should be a read-only file prepared by the deployment on the Docker host.
+Hermes passes the configured masks to Docker after the directory mounts.
 
 This is opt-in. Deployment templates, enabled toolsets and standalone plugins are not changed
 by enabling support in the Hermes codebase.
