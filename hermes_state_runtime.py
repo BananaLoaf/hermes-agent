@@ -103,6 +103,7 @@ def _row(row):
     result['payload'] = json.loads(result.pop('payload_json'))
     result.pop('payload_digest')
     result.pop('lineage_json')
+    result.pop('recovery_checkpoint', None)
     result.pop('retired_at', None)  # tombstone retention stamp, not admission state
     return result
 
@@ -224,14 +225,22 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
             return None
         generation = session['runtime_generation'] + 1
         conn.execute('UPDATE sessions SET runtime_generation=? WHERE id=?', (generation, session_id))
-        changed = conn.execute("UPDATE session_admissions SET status='started',owner_epoch=?,generation=? WHERE admission_id=? AND status='queued'", (epoch, generation, row['admission_id']))
+        # Settlement needs the mark to recognize this turn's own transcript boundary.
+        mark = conn.execute('SELECT COALESCE(MAX(id), 0) FROM messages').fetchone()[0]
+        checkpoint = None
+        if row['principal_id'] == 'api' and session['source'] == 'api_server':
+            from hermes_state_runtime_recovery import api_turn_checkpoint
+            checkpoint = api_turn_checkpoint(db, conn, session_id, mark)
+            # Once another turn claims the transcript, older failed runs can no longer be retried.
+            conn.execute("UPDATE session_admissions SET recovery_checkpoint=NULL WHERE target_session_id=? "
+                         "AND status='terminal' AND recovery_checkpoint IS NOT NULL", (session_id,))
+        changed = conn.execute("UPDATE session_admissions SET status='started',owner_epoch=?,generation=?,"
+                               "recovery_checkpoint=? WHERE admission_id=? AND status='queued'",
+                               (epoch, generation, checkpoint, row['admission_id']))
         if changed.rowcount != 1:
             raise RuntimeStoreError('stale_generation')
         claimed = _row(_admission(conn, row['admission_id']))
-        # The transcript high-water mark at the claim (``messages.id`` is AUTOINCREMENT across every
-        # session): a row above it on this conversation was written by this turn, so settlement can
-        # tell this turn's own failed-turn boundary from an earlier turn's (#134889 GW-21).
-        claimed['transcript_mark'] = conn.execute('SELECT COALESCE(MAX(id), 0) FROM messages').fetchone()[0]
+        claimed['transcript_mark'] = mark
         return claimed
     return db._execute_write(write)
 
@@ -261,7 +270,12 @@ def settle_session_input(db, *, epoch: int, admission_id: str, generation: int, 
             conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) '
                          'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                          (RESULT_PREFIX + admission_id, encoded))
-        conn.execute("UPDATE session_admissions SET status='terminal',outcome=? WHERE admission_id=?", (outcome, admission_id))
+        turn = (result or {}).get('result') or {}
+        retryable_run = row['request_id'].startswith('run_') and (
+            outcome in ('failed', 'interrupted') or turn.get('failed') or turn.get('error')
+            or turn.get('partial') or turn.get('completed') is False)
+        conn.execute("UPDATE session_admissions SET status='terminal',outcome=?,recovery_checkpoint=? "
+                     "WHERE admission_id=?", (outcome, row['recovery_checkpoint'] if retryable_run else None, admission_id))
         settle_steer_transfers(conn, epoch=epoch, generation=generation, transfers=_transfers, outcome=outcome)
         conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
         return _row(_admission(conn, admission_id))
@@ -681,7 +695,7 @@ def resolve_unknown_session_input(db, *, epoch: int, admission_id: str, generati
         if _terminal_write is not None:
             _terminal_write(conn, row)
         _retire_admission_workers(conn, row, row['owner_epoch'])
-        conn.execute("UPDATE session_admissions SET status='terminal',outcome=? WHERE admission_id=?",
+        conn.execute("UPDATE session_admissions SET status='terminal',outcome=?,recovery_checkpoint=NULL WHERE admission_id=?",
                      (outcome, admission_id))
         conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
         return _row(_admission(conn, admission_id))

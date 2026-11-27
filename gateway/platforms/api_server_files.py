@@ -63,6 +63,27 @@ def validate_file_part_limit(contents: list[Any]) -> None:
         )
 
 
+def run_file_metadata(content):
+    """Describe files uploaded to the active profile, without reading their bytes."""
+    validate_file_part_limit([content])
+    files = []
+    store = APIFileStore()
+    for part in content:
+        if not contains_file_part([part]):
+            continue
+        source = part.get("file", part)
+        if not isinstance(source, dict) or "file_id" not in source:
+            continue
+        try:
+            record = store.get(source["file_id"])
+        except (APIFileNotFoundError, APIFileCorruptError) as exc:
+            raise ValueError("file_not_found:An uploaded file is no longer available.") from exc
+        files.append({"id": record.id, "filename": record.filename, "bytes": record.bytes})
+    if sum(file["bytes"] for file in files) > MAX_API_FILE_BYTES:
+        raise ValueError("file_too_large:Uploaded files exceed 20 MiB in total.")
+    return files
+
+
 def _decode_file_data(source: dict[str, Any]) -> tuple[bytes, str, str]:
     file_data = source.get("file_data")
     if not isinstance(file_data, str) or not file_data.strip():

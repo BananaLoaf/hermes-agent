@@ -976,7 +976,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 # Internal self-injected turn: type the persisted user row so UIs render it as a
                 # timeline notice, not a user bubble (stripped from provider payloads downstream).
                 kwargs["persist_user_display_kind"] = ctx.persist_user_display_kind
-            if ctx.persist_user_display_metadata:
+            if api is not None and api.get('input_display') is not None:
+                kwargs["persist_user_display_metadata"] = {"api_input": api['input_display']}
+            elif ctx.persist_user_display_metadata:
                 kwargs["persist_user_display_metadata"] = ctx.persist_user_display_metadata
             if ctx.moa_config is not None:
                 kwargs["moa_config"] = ctx.moa_config

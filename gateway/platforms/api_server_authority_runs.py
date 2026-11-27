@@ -65,6 +65,19 @@ def run_admission(adapter, run_id):
     return (authority, _row(rows[0])) if rows else None
 
 
+def latest_run(adapter, session_id):
+    authority = _authority(adapter)
+    if authority is None:
+        return None
+    root = authority.logical_owner(session_id)
+    with authority.db._read_ctx() as conn:
+        row = conn.execute('SELECT principal_id, request_id FROM session_admissions '
+                           'WHERE target_session_id=? ORDER BY seq DESC LIMIT 1', (root,)).fetchone()
+    if row is None or row['principal_id'] != 'api' or not row['request_id'].startswith('run_'):
+        return None
+    return row['request_id']
+
+
 def run_projection(adapter, run_id):
     owned = run_admission(adapter, run_id)
     if owned is None:
@@ -92,9 +105,24 @@ def run_projection(adapter, run_id):
         pending = list(live.controls.snapshot(row['target_session_id'], row['generation']))
         if any(prompt.get('kind') == 'approval' for prompt in pending):
             status = 'waiting_for_approval'  # the documented run state main's run store reports
-    return {'pending_controls': pending, 'run_id': run_id, 'status': status, 'session_id': row['target_session_id'],
+    output = result.get('final_response', '')
+    if status == 'completed' and isinstance(output, str) and 'MEDIA:' in output:
+        from gateway.session_api_media import stored_reply_display_text
+        rendered = stored_reply_display_text(authority.db, result)
+        if isinstance(rendered, str):
+            output = rendered
+        # The agent can settle before the run's outbound file upload finishes.
+        elif adapter._outbound_files.provider.persist_rendered_text:
+            delivery = adapter._run_statuses.get(run_id, {})
+            if delivery.get('status') in ('running', 'completed'):
+                status, output = delivery['status'], delivery.get('output', '')
+    projection = {'pending_controls': pending, 'run_id': run_id, 'status': status, 'session_id': row['target_session_id'],
             'admission_id': row['admission_id'], 'execution_generation': row['generation'],
-            'output': result.get('final_response', ''), 'usage': saved.get('usage', {}) if saved else {}}
+            'output': output, 'usage': saved.get('usage', {}) if saved else {}}
+    if status == 'failed' and isinstance(result.get('error'), str):
+        from gateway.platforms.api_server import _redact_api_error_text
+        projection['error'] = _redact_api_error_text(result['error'])
+    return projection
 
 
 async def send_clarify(adapter, *, chat_id, **kwargs):

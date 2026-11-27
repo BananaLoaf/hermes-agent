@@ -19,6 +19,7 @@ from functools import wraps
 import logging
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -395,6 +396,10 @@ def _project_client_message(message: dict[str, Any]) -> dict[str, Any]:
         projected = {k: v for k, v in message.items() if k not in _COMPACTION_INTERNAL_FIELDS}
         projected["content"] = ""
         projected["display_kind"] = "hidden"
+    elif projected.get("role") == "assistant":
+        rendered = (projected.get("display_metadata") or {}).get("display_text")
+        if isinstance(rendered, str):
+            projected = {**projected, "content": rendered}
     return projected
 
 
@@ -3177,7 +3182,14 @@ class APIServerAdapter(OpenAIFilesRoutesMixin, OpenAICompatRoutesMixin, BasePlat
         session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
         if err:
             return err
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        payload = {"object": "hermes.session", "session": self._session_response(session)}
+        if request.query.get('include_latest_run') == 'true':
+            from gateway.platforms.api_server_authority_runs import latest_run
+            run_id = await asyncio.to_thread(latest_run, self, session['id'])
+            if run_id and self._request_owns_run(request, run_id):
+                status = self._durable_run_status(request, run_id) or {}
+                payload['latest_run'] = {key: status[key] for key in ('run_id', 'status', 'error') if key in status}
+        return web.json_response(payload)
 
     @_require_auth
     async def _handle_patch_session(self, request: web.Request) -> web.Response:
@@ -3281,9 +3293,10 @@ class APIServerAdapter(OpenAIFilesRoutesMixin, OpenAICompatRoutesMixin, BasePlat
         limit = 500 if default_page else min(requested_limit, 500)
         include_compacted = _coerce_request_bool(request.query.get("include_compacted"), default=False)
         # Compression lineage: return root→tip messages, matching the REST router (#51058).
+        from gateway.session_api_media import load_session_messages
         messages = await asyncio.to_thread(
-            db.get_messages, resolved_id, limit=limit, offset=offset, latest=latest_page,
-            include_compacted=include_compacted, include_ancestors=True)
+            load_session_messages, db, resolved_id, limit=limit, offset=offset, latest=latest_page,
+            include_compacted=include_compacted)
         return web.json_response({
             "object": "list", "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
@@ -4712,6 +4725,37 @@ class APIServerAdapter(OpenAIFilesRoutesMixin, OpenAICompatRoutesMixin, BasePlat
     async def _render_outbound_text(self, text: str) -> str:
         """Render a complete one-shot response through the egress processor."""
         return await self._new_media_response_processor().render(text)
+
+    async def _render_final_outbound_text(
+        self, result: dict, outbound: MediaResponseProcessor | None = None, *, replay: bool = False,
+    ) -> str:
+        """Render the final reply and retain it only when the provider opts in."""
+        from gateway.session_api_media import reply_row_id, retain_rendered_reply, stored_reply_display_text
+
+        raw = result.get('final_response') or ''
+        if 'MEDIA:' not in raw:
+            return raw
+        persist = self._outbound_files.provider.persist_rendered_text
+        db = None
+        if (persist or replay) and result.get('session_id') and reply_row_id(result) is not None:
+            db = await self._ensure_session_db_async()
+            if db is not None:
+                try:
+                    saved = await asyncio.to_thread(stored_reply_display_text, db, result)
+                    if isinstance(saved, str):
+                        return saved
+                except (OSError, sqlite3.Error):
+                    logger.warning("Could not read rendered API reply", exc_info=True)
+        if replay:
+            return raw
+        rendered = await (outbound.render(raw) if outbound is not None else self._render_outbound_text(raw))
+        if (db is not None and rendered != raw and persist
+                and not result.get('interrupted') and not result.get('failed') and result.get('completed') is not False):
+            try:
+                return await asyncio.to_thread(retain_rendered_reply, db, result, rendered)
+            except (OSError, sqlite3.Error):
+                logger.warning("Could not persist rendered API reply", exc_info=True)
+        return rendered
 
     def _with_outbound_files_prompt(self, prompt: Optional[str]) -> str:
         """Append the active provider's delivery contract to managed instructions."""

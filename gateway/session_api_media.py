@@ -1,4 +1,4 @@
-"""API image parts become committed media references that outlive the transient turn."""
+"""Durable media and attachment display in API sessions."""
 import base64
 import hashlib
 import os
@@ -173,3 +173,83 @@ def rehydrate_api_images(content, media):
                         'url': f'data:{mimes.get(path.suffix, "image/png")};base64,{data}'}}
         parts.append(part)
     return parts
+
+
+_REPLY_DISPLAY_SQL = "SELECT display_metadata FROM messages WHERE id=? AND session_id=? AND role='assistant'"
+
+
+def reply_row_id(result):
+    """Reuse the turn receipt's row address, or its committed final message."""
+    from agent.persisted_turn_receipt import committed_row_id
+
+    receipt = result.get('persisted_turn') or {}
+    if row_id := receipt.get('final_assistant_row_id'):
+        return row_id
+    messages = result.get('messages') or []
+    last = messages[-1] if messages else None
+    if not isinstance(last, dict) or last.get('role') != 'assistant' or last.get('tool_calls'):
+        return None
+    start = result.get('current_turn_user_idx')
+    row_id = committed_row_id(last)
+    if row_id in receipt.get('row_ids', ()) or (type(start) is int and 0 <= start < len(messages) - 1):
+        return row_id
+    return None
+
+
+def stored_reply_display_text(db, result):
+    row_id = reply_row_id(result)
+    if row_id is not None:
+        row = db._read_one(_REPLY_DISPLAY_SQL, (row_id, result.get('session_id')))
+        if row is not None:
+            return (db._decode_display_metadata(row[0]) or {}).get('display_text')
+
+
+def retain_rendered_reply(db, result, rendered):
+    """Keep the delivered text on the existing transcript row, separate from model context."""
+    from agent.redact import redact_sensitive_text
+
+    row_id = reply_row_id(result)
+    if row_id is None:
+        return rendered
+    rendered = redact_sensitive_text(rendered)
+
+    def write(conn):
+        row = conn.execute(_REPLY_DISPLAY_SQL, (row_id, result.get('session_id'))).fetchone()
+        if row is None:
+            return rendered
+        metadata = db._decode_display_metadata(row[0]) or {}
+        if isinstance(metadata.get('display_text'), str):
+            return metadata['display_text']
+        metadata['display_text'] = rendered
+        conn.execute("UPDATE messages SET display_metadata=? WHERE id=?",
+                     (db._encode_display_metadata(metadata), row_id))
+        return rendered
+
+    return db._execute_write(write)
+
+
+def load_session_messages(db, session_id, *, limit, offset, latest, include_compacted):
+    """Keep previously exported links when compaction copied a reply before export finished."""
+    import json
+
+    messages = db.get_messages(session_id, limit=limit, offset=offset, latest=latest,
+                               include_compacted=include_compacted, include_ancestors=True)
+    pending = [msg for msg in messages if msg['role'] == 'assistant' and msg.get('message_uid')
+               and isinstance(msg.get('content'), str) and 'MEDIA:' in msg['content']
+               and 'display_text' not in (msg.get('display_metadata') or {})]
+    if not pending:
+        return messages
+    rows = db._read_all(
+        "SELECT message_uid,content,display_metadata FROM messages WHERE role='assistant' "
+        "AND session_id IN (SELECT value FROM json_each(?)) "
+        "AND message_uid IN (SELECT value FROM json_each(?)) AND display_metadata IS NOT NULL ORDER BY id",
+        (json.dumps(db._resume_lineage_ids(session_id)), json.dumps(list({msg['message_uid'] for msg in pending}))))
+    rendered = {
+        (row['message_uid'], row['content']): text for row in rows
+        if isinstance(text := (db._decode_display_metadata(row['display_metadata']) or {}).get('display_text'), str)
+    }
+    for msg in pending:
+        text = rendered.get((msg['message_uid'], db._encode_content(msg['content'])))
+        if text is not None:
+            msg['display_metadata'] = {**(msg.get('display_metadata') or {}), 'display_text': text}
+    return messages

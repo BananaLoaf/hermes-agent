@@ -55,10 +55,11 @@ def check_api_turn(authority, ref, payload):
     if 'api_turn_v1' in payload:
         data = payload['api_turn_v1']
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
-                         'relay_metadata', 'resume_unanswered'}
+                         'relay_metadata', 'resume_unanswered', 'input_display'}
                 or data.get('resume_unanswered', True) is not True
                 or not {'history', 'settings'} <= set(data)
                 or not isinstance(data.get('relay_metadata', {}), dict)
+                or not isinstance(data.get('input_display', {}), dict)
                 or (data['history'] is not None and not isinstance(data['history'], list))
                 or ('run_owner_scope' in data and not _valid_owner_scope(data['run_owner_scope']))
                 or ('browser_control' in data and not _valid_browser_control(data['browser_control']))):
@@ -228,6 +229,8 @@ def admit_api_steps(adapter, **kwargs):
         # The request's Relay metadata rides the admission to the turn it describes (main passed it
         # to ``run_conversation``); it is client JSON, so it is part of the exact-retry identity.
         payload['api_turn_v1']['relay_metadata'] = kwargs['relay_metadata']
+    if kwargs.get('input_display') is not None:
+        payload['api_turn_v1']['input_display'] = kwargs['input_display']
     request_id = kwargs.get('request_id') or kwargs.get('active_run_id') or uuid.uuid4().hex
     if not isinstance(kwargs['user_message'], list):
         return (yield from _admit_api_payload(authority, adapter, sid, request_id, payload, settings, declared_key, kwargs))
@@ -262,11 +265,17 @@ def _admit_api_payload(authority, adapter, sid, request_id, payload, settings, d
     ref = yield from bind_api_steps(authority, sid, hosted_dispatch=kwargs.get("room_dispatch"), declared_key=declared_key,
                                     caller_key=kwargs.get('gateway_session_key'), walked_from=kwargs.get('walked_from'))
     check_api_turn(authority, ref, payload)
+    def authorize(conn):
+        _admit_target(sid, request_id, payload['api_turn_v1']['settings'], conn,
+                      client_key=bool(kwargs.get('request_id')))
+        if previous_run := kwargs.get('retry_of'):
+            from hermes_state_runtime_recovery import retry_api_turn
+            retry_api_turn(authority.db, conn, epoch=authority.epoch, session_id=sid,
+                           previous_run=previous_run, text=kwargs['retry_text'])
+
     row = yield partial(admit_session_input, authority.db, epoch=authority.epoch, principal_id='api',
                         session_id=sid, request_id=request_id, payload=payload,
-                        _authorize_write=authority._admission_gate(partial(
-                            _admit_target, sid, request_id, payload['api_turn_v1']['settings'],
-                            client_key=bool(kwargs.get('request_id')))))
+                        _authorize_write=authority._admission_gate(authorize))
     return authority, ref, row
 
 
@@ -481,6 +490,7 @@ def prepare_api_execution(authority, ref, payload):
         content = restore_api_images(content, data.get('media') or [])
     return {'adapter': adapter, 'settings': settings, 'history': data['history'] if data else None,
             'content': content, 'turn_author': data.get('turn_author') if data else None,
+            'input_display': data.get('input_display') if data else None,
             'relay_metadata': data.get('relay_metadata') if data else None,
             'resume_unanswered': bool(data and data.get('resume_unanswered')),
             'browser_control': _rebind_browser_control(adapter, data)}
