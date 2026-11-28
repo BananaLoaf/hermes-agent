@@ -58,6 +58,7 @@ _SSH_KEYS = (("host", "ssh_host", ""), ("user", "ssh_user", ""), ("port", "ssh_p
 _RESOURCE_KEYS = (("cpu", "container_cpu", 1), ("memory", "container_memory", 5120),
                   ("disk", "container_disk", 51200), ("persistent_filesystem", "container_persistent", True))
 _CONTAINER_KEYS = (
+    ("docker_profile_scope", None),
     ("container_cpu", 1), ("container_memory", 5120), ("container_disk", 51200),
     ("container_persistent", True), ("modal_mode", "auto"), ("vercel_runtime", ""), ("vercel_image", ""),
     ("docker_volumes", []), ("docker_mount_cwd_to_workspace", False), ("docker_forward_env", []),
@@ -67,6 +68,7 @@ _CONTAINER_KEYS = (
     ("docker_image_pinned", False),
 )
 _DOCKER_KWARGS = (
+    ("profile_scope", "docker_profile_scope", None),
     ("volumes", "docker_volumes", []), ("auto_mount_cwd", "docker_mount_cwd_to_workspace", False),
     ("forward_env", "docker_forward_env", []), ("env", "docker_env", {}),
     ("run_as_host_user", "docker_run_as_host_user", False), ("network", "docker_network", True),
@@ -134,7 +136,7 @@ def _build_local_env(*, cwd, timeout, local_config=None, **_):
     return _LocalEnvironment(cwd=cwd, timeout=timeout, persistent=(local_config or {}).get("persistent", True))
 
 
-def _build_docker_env(*, image, cwd, timeout, cc, task_id, host_cwd, **_):
+def _build_docker_env(*, image, cwd, timeout, cc, task_id, host_cwd, probe_only=False, **_):
     from tools.terminal_tool import (_docker_session_isolation_enabled, _has_isolation_overrides,
                                      _maybe_reap_docker_orphans)
     # One-shot reaper for labeled containers orphaned by prior Hermes processes that died before
@@ -150,6 +152,8 @@ def _build_docker_env(*, image, cwd, timeout, cc, task_id, host_cwd, **_):
         kwargs["persist_across_processes"] = False
     docker_env_obj = _DockerEnvironment(image=image, cwd=cwd, timeout=timeout, task_id=task_id, host_cwd=host_cwd,
                                         **_resources(cc), **kwargs)
+    if probe_only and cc.get("docker_profile_scope"):
+        docker_env_obj._profile_probe = True
     # Marker read by is_persistent_env(): a session-scoped container survives BETWEEN turns (skip
     # per-turn teardown) but is removed at session close / idle timeout. Test doubles may reject attrs.
     if session_scoped:

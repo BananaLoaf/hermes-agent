@@ -31,7 +31,7 @@ def _create_configured_env(
     (shared by the terminal tool, the file tools and the lazy :func:`ensure_task_env` bring-up)."""
     from tools.terminal_tool_backends import _create_environment
     from tools.terminal_tool_config import _is_container_backend
-    return _create_environment(
+    environment = _create_environment(
         env_type=env_type, image=image, cwd=cwd, timeout=timeout,
         ssh_config=_ssh_config_from_config(config) if env_type == "ssh" else None,
         container_config=(
@@ -40,6 +40,11 @@ def _create_configured_env(
         local_config=_local_config_from_config(config) if env_type == "local" else None,
         task_id=task_id, host_cwd=host_cwd,
     )
+    if config.get('docker_profile_scope'):
+        from tools.environments.docker_profile import material_key
+        environment._hermes_profile_config = material_key(config)
+        environment._hermes_profile_lifetime = config['lifetime_seconds']
+    return environment
 
 
 def _cleanup_env(env: Any, *, force_remove: Optional[bool] = None) -> None:
@@ -119,7 +124,7 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
             # A workspace container is keyed by its digest, not the spawning task id: also keep it
             # while any process it hosts is still running (stopping it would kill that process).
             if process_registry.has_active_processes(task_id) or (
-                    _is_workspace_key(task_id)
+                    (_is_workspace_key(task_id) or str(task_id).startswith("docker-profile:"))
                     and process_registry._any_running(lambda s, key=task_id: s.task_id == key)):
                 _last_activity[task_id] = current_time
     except ImportError:
@@ -128,7 +133,8 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # Phase 1: unregister stale entries atomically under the lock; phase 2:
     # stop them outside it (see _unregister_env for why).
     with _env_lock:
-        stale = [t for t, last in list(_last_activity.items()) if current_time - last > lifetime_seconds]
+        stale = [t for t, last in list(_last_activity.items())
+                 if current_time - last > getattr(_active_environments.get(t), '_hermes_profile_lifetime', lifetime_seconds)]
         envs_to_stop = [(t, _active_environments.pop(t, None)) for t in stale]
         for t in stale:
             _last_activity.pop(t, None)
@@ -138,6 +144,10 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     for task_id, env in envs_to_stop:
         if env is not None:
             _clear_file_ops_cache(task_id)
+            if getattr(env, "_profile_scope", None):
+                # Another gateway or a new turn can already be using this same
+                # container. Idle eviction releases only this process's cache.
+                continue
             if _is_workspace_key(task_id) and callable(getattr(env, "stop_idle", None)):
                 # Persistent per-workspace container: stop it (state kept, restarted on next use)
                 # instead of leaving it running forever like the one profile container.
@@ -272,6 +282,13 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     directly, so persist-mode idle envs are likewise no-op'd; only the orphan
     reaper at next startup reclaims them.
     """
+    from tools.terminal_scope import terminal_env
+    if terminal_env('TERMINAL_ISOLATION_SCOPE', 'default') == 'profile' and terminal_env('TERMINAL_ENV', 'local') == 'docker':
+        from tools.terminal_tool import _resolve_container_task_id
+        owner_key = _resolve_container_task_id(task_id)
+        if str(task_id).startswith('docker-profile:') and task_id != owner_key:
+            raise ValueError('Cannot tear down another profile container')
+        task_id = owner_key
     env = _unregister_env(task_id)
     _clear_file_ops_cache(task_id)
     if env is None:

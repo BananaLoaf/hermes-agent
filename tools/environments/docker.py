@@ -211,6 +211,8 @@ def reap_orphan_containers(
         age = (now - finished_at).total_seconds()
         if age < max_age_seconds:
             continue
+        if _is_profile_container(docker, cid):
+            continue
         strip_sandbox_privileges(docker, cid)  # its teardown never ran; owners stay (it may restart)
         if _is_idle_workspace_container(docker, cid):
             continue
@@ -227,6 +229,13 @@ def reap_orphan_containers(
         else:
             logger.debug("docker rm %s failed: %s", cid[:12], result.stderr.strip())
     return removed
+
+
+def _is_profile_container(docker_exe: str, container_id: str) -> bool:
+    result = _docker_query([docker_exe, 'inspect', '--format',
+        '{{index .Config.Labels "hermes-terminal-scope"}}', container_id], timeout=10,
+        fail='profile container ownership probe failed: %s')
+    return result is None or result.returncode != 0 or result.stdout.strip() == 'profile'
 
 
 def _is_idle_workspace_container(docker_exe: str, container_id: str) -> bool:
@@ -649,6 +658,8 @@ class DockerEnvironment(BaseEnvironment):
     size-limited tmpfs). The container is the security boundary — its filesystem stays
     writable so agents can install packages. Persistence bind-mounts /workspace and /root."""
 
+    _profile_probe = False
+    _profile_scope: dict | None = None
     _passwordless_sudo_probe_supported = True
     _profile_scoped_passthrough = True
 
@@ -678,10 +689,14 @@ class DockerEnvironment(BaseEnvironment):
         shm_size: str = _DEFAULT_SHM_SIZE,
         shared_container_key: str = "",
         snap_compat: bool = False,
-        image_pinned: bool = False):
+        image_pinned: bool = False,
+        profile_scope: dict | None = None):
         if cwd == "~":
             cwd = "/root"
         super().__init__(cwd=cwd, timeout=timeout)
+        self._profile_scope = profile_scope
+        if profile_scope:
+            task_id = 'docker-profile:' + profile_scope['identity']
         self._persistent = persistent_filesystem
         self._persist_across_processes = persist_across_processes
         # Set by terminal_tool._create_environment for session-scoped containers
@@ -703,6 +718,8 @@ class DockerEnvironment(BaseEnvironment):
             volumes = []
 
         _ensure_docker_available()
+        from tools.environments.docker_profile_runtime import prepare_mounts
+        volumes = prepare_mounts(self, volumes, extra_args)
 
         resource_args = self._resource_args(image, cpu, memory, disk, network, shm_size, extra_args)
         volume_args, writable_args = self._mount_args(volumes, host_cwd, auto_mount_cwd, task_id)
@@ -713,7 +730,8 @@ class DockerEnvironment(BaseEnvironment):
                 mount, cwd)
             cwd = mount
             self.cwd = mount
-        volume_args.extend(_readonly_skill_mount_args())
+        if not self._profile_scope:
+            volume_args.extend(_readonly_skill_mount_args())
         egress_label, egress_volume_args, egress_host_args, env_args, validated_extra = (
             self._egress_and_env_args(extra_args))
         volume_args.extend(egress_volume_args)
@@ -722,12 +740,19 @@ class DockerEnvironment(BaseEnvironment):
         # Resolved once so it works when /usr/local/bin is not in PATH (macOS services).
         self._docker_exe = find_docker() or "docker"
 
+        passive_start = self._profile_scope is not None and "firewall" in self._profile_scope
+        self._idle_command = ["sleep", "infinity"]
+        if passive_start:
+            # Run only sleep while the profile firewall is being installed.
+            validated_extra += ["--entrypoint=/bin/sleep", "--no-healthcheck"]
+            self._idle_command = ["infinity"]
+
         # s6-overlay images (e.g. hermes-agent:latest) already use /init as PID 1 and exec
         # /run/s6/basedir/bin/init during startup. For those images we must (a) skip Docker's --init (two
         # competing PID-1 inits) and (b) mount /run with exec instead of noexec, or s6 stage0 dies with exit
         # 126 "Permission denied". Detected once here; defaults are kept on any inspection failure. See
         # issue #34628.
-        image_uses_s6_init = _image_uses_init_entrypoint(self._docker_exe, image)
+        image_uses_s6_init = not passive_start and _image_uses_init_entrypoint(self._docker_exe, image)
         if image_uses_s6_init:
             logger.info(
                 "Docker: image %s uses /init (s6-overlay) as entrypoint — "
@@ -773,11 +798,12 @@ class DockerEnvironment(BaseEnvironment):
         self._image_uses_s6_init = image_uses_s6_init
         self._all_run_args = all_run_args
 
-        reused = persist_across_processes and self._attach_existing_container(
-            task_label, profile_name, egress_label, network)
-        if not reused:
-            self._container_id = self._docker_run(cwd)
-        else:  # it never stopped, so no teardown stripped what it left
+        from tools.environments.docker_profile_runtime import apply_profile_labels
+        from tools.environments.docker_profile import connect
+        apply_profile_labels(self, image, resource_args, user_args, validated_extra,
+                             requested=[cpu, memory, disk, network, shm_size, run_as_host_user, snap_compat])
+        reused = connect(self, task_label, profile_name, egress_label, network)
+        if reused:
             strip_sandbox_privileges(self._docker_exe, self._container_id)
         reclaim_sandbox_files(self._docker_exe, self._container_id, self._sandbox_mounts)
 
@@ -862,18 +888,12 @@ class DockerEnvironment(BaseEnvironment):
         is the drive shape, not a username.
         """
         volume_args: list[str] = []
-        for vol in (volumes or []):
-            if not isinstance(vol, str):
-                logger.warning("Docker volume entry is not a string: %r", vol)
-                continue
-            vol = vol.strip()
-            if not vol:
-                continue
-            if ":" not in vol:
-                logger.warning("Docker volume '%s' missing colon, skipping", vol)
-                continue
-            volume_args.extend(["-v", vol])
-        workspace_explicitly_mounted = any(":/workspace" in v for v in volume_args)
+        from tools.environments.docker_profile_runtime import append_mount_arg, claims_target
+        for vol in volumes or []:
+            append_mount_arg(volume_args, vol)
+        if self._profile_scope:
+            return volume_args, []
+        workspace_explicitly_mounted = claims_target(volume_args, "/workspace")
 
         host_cwd_abs = _abs_host_cwd(host_cwd) if host_cwd else ""
         windows_cwd = _is_windows_drive_path(host_cwd or "") or _is_windows_drive_path(host_cwd_abs)
@@ -1037,13 +1057,13 @@ class DockerEnvironment(BaseEnvironment):
             "-w", workdir,
             *self._all_run_args,
             self._image,
-            "sleep", "infinity"]
+            *self._idle_command]
 
     def _docker_run(self, cwd: str) -> str:
         """Start a fresh container and return its id. A failed ``docker run`` (exit 125, timeout
         mid-pull) can leave a "Created" orphan the exited-only reaper never catches, so it is
         removed by name before re-raising."""
-        container_name = f"hermes-{uuid.uuid4().hex[:8]}"
+        container_name = self._profile_scope["name"] if self._profile_scope else f"hermes-{uuid.uuid4().hex[:8]}"
         run_cmd = self._run_command(container_name, cwd)
         logger.debug("Starting container: %s", ' '.join(run_cmd))
         try:
@@ -1051,6 +1071,8 @@ class DockerEnvironment(BaseEnvironment):
                 run_cmd, timeout=120, check=True,  # image pull may take a while
                 env=self._docker_client_env(self._run_env_values))
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            if self._profile_scope:
+                raise  # Never remove a deterministic name after an ambiguous failure.
             logger.warning("docker run failed for %s, cleaning up orphaned container: %s", container_name, e)
             subprocess.run(
                 [self._docker_exe, "rm", "-f", container_name],
@@ -1139,6 +1161,15 @@ class DockerEnvironment(BaseEnvironment):
         """Recreate a container removed out-of-band: label-based reuse first (another process
         may have recreated it), else a fresh one from the saved image/run-args. False when
         recovery fails so the caller surfaces the original error."""
+        if self._profile_scope:
+            from tools.environments.docker_profile import connect
+            scope = self._profile_scope
+            self._container_id = None
+            connect(self, '', scope['profile'], '', True)
+            self._snapshot_ready = False
+            self.init_session()
+            self._mark_recreated()
+            return True
         logger.warning("Container %s appears to be gone — attempting recovery", (self._container_id or "")[:12])
         self._container_id = None
 
@@ -1297,6 +1328,8 @@ class DockerEnvironment(BaseEnvironment):
         the thread to finish before the interpreter exits, so ``docker stop`` / ``docker rm`` actually
         completes when we do trigger it.
         """
+        if self._profile_probe:
+            force_remove = False  # A one-shot prompt probe borrows the profile container.
         container_id = self._container_id
         if not container_id:
             # Bind-mount dirs are still dropped in non-persistent mode.
