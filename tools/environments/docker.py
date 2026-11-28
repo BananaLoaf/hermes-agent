@@ -740,12 +740,19 @@ class DockerEnvironment(BaseEnvironment):
         # Resolved once so it works when /usr/local/bin is not in PATH (macOS services).
         self._docker_exe = find_docker() or "docker"
 
+        passive_start = self._profile_scope is not None and "firewall" in self._profile_scope
+        self._idle_command = ["sleep", "infinity"]
+        if passive_start:
+            # Run only sleep while the profile firewall is being installed.
+            validated_extra += ["--entrypoint=/bin/sleep", "--no-healthcheck"]
+            self._idle_command = ["infinity"]
+
         # s6-overlay images (e.g. hermes-agent:latest) already use /init as PID 1 and exec
         # /run/s6/basedir/bin/init during startup. For those images we must (a) skip Docker's --init (two
         # competing PID-1 inits) and (b) mount /run with exec instead of noexec, or s6 stage0 dies with exit
         # 126 "Permission denied". Detected once here; defaults are kept on any inspection failure. See
         # issue #34628.
-        image_uses_s6_init = _image_uses_init_entrypoint(self._docker_exe, image)
+        image_uses_s6_init = not passive_start and _image_uses_init_entrypoint(self._docker_exe, image)
         if image_uses_s6_init:
             logger.info(
                 "Docker: image %s uses /init (s6-overlay) as entrypoint — "
@@ -1050,7 +1057,7 @@ class DockerEnvironment(BaseEnvironment):
             "-w", workdir,
             *self._all_run_args,
             self._image,
-            "sleep", "infinity"]
+            *self._idle_command]
 
     def _docker_run(self, cwd: str) -> str:
         """Start a fresh container and return its id. A failed ``docker run`` (exit 125, timeout

@@ -62,6 +62,8 @@ class Daemon:
                     out = '2000-01-01T00:00:00Z'
                 elif value and 'hermes-terminal-scope' in template:
                     out = value['Config']['Labels'].get('hermes-terminal-scope', '')
+                elif value and '.HostConfig' in template:
+                    out = json.dumps(value['HostConfig'])
             elif verb == 'ps':
                 out = '\n'.join(v['Id'] for v in self.containers.values() if not v['State']['Running'])
             elif verb == 'inspect' and '--format' not in args:
@@ -76,7 +78,9 @@ class Daemon:
                 self.serial += 1
                 labels = {args[i + 1].split('=', 1)[0]: args[i + 1].split('=', 1)[1]
                           for i, value in enumerate(args) if value == '--label'}
-                value = dict(Id=f'container-{self.serial}', Config=dict(Labels=labels), State=dict(Running=True))
+                caps = [args[i + 1] for i, arg in enumerate(args) if arg == '--cap-add']
+                value = dict(Id=f'container-{self.serial}', Config=dict(Labels=labels), State=dict(Running=True),
+                             HostConfig=dict(NetworkMode='terminal-network', Privileged=False, CapAdd=caps))
                 self.containers[name] = value
                 out = value['Id']
             elif verb in ('start', 'stop', 'rm'):
@@ -171,6 +175,46 @@ def test_profile_restart_reports_docker_error(profiles, daemon, monkeypatch):
     with pytest.raises(RuntimeError, match=f'{name}: network namespace is unavailable'):
         environment(profiles[0])
     assert daemon.containers[name]['Id'] == first._container_id
+
+
+def test_profile_firewall_is_required_before_session_init(profiles, daemon, monkeypatch):
+    from tools.environments import docker_profile_firewall
+
+    home = profiles[0]
+    path = home / 'config.yaml'
+    config = json.loads(path.read_text())
+    config['terminal'].update(docker_firewall_image='test/nft', docker_denied_cidrs=['100.64.0.0/10'])
+    path.write_text(json.dumps(config))
+    monkeypatch.setattr(docker_profile_firewall, 'run_capture', daemon)
+    events = []
+    firewall_ok = False
+
+    def run(args, **kwargs):
+        if 'test/nft' in args:
+            assert '--cap-add=NET_ADMIN' in args
+            assert args[args.index('--network') + 1].startswith('container:')
+            assert 'ip daddr { 100.64.0.0/10 } drop' in kwargs['input']
+            events.append('firewall')
+            return subprocess.CompletedProcess(args, 0 if firewall_ok else 1, '', 'nft failed')
+        return daemon(args, **kwargs)
+
+    monkeypatch.setattr(docker_profile_firewall.subprocess, 'run', run)
+    monkeypatch.setattr(docker_env.DockerEnvironment, 'init_session', lambda _: events.append('init'))
+    with pytest.raises(RuntimeError, match='nft failed'):
+        environment(home)
+    assert events == ['firewall']
+    launch = next(call for call in daemon.calls if '-d' in call)
+    assert launch[-4:] == ['--entrypoint=/bin/sleep', '--no-healthcheck', 'image-one', 'infinity']
+    assert 'NET_ADMIN' not in str(launch)
+
+    firewall_ok = True
+    live = environment(home)
+    assert events[-2:] == ['firewall', 'init']
+
+    daemon.containers[live._profile_scope['name']]['State']['Running'] = False
+    assert environment(home)._container_id == live._container_id
+    assert any(call[1] == 'start' for call in daemon.calls)
+    assert events == ['firewall', 'firewall', 'init', 'firewall', 'init']
 
 
 def test_simultaneous_first_use_creates_only_one_container(profiles, daemon):

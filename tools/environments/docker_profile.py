@@ -9,6 +9,7 @@ import re
 import threading
 
 from hermes_constants import get_hermes_home, profile_name_for_home
+from tools.environments.docker_profile_firewall import apply_firewall, firewall_config
 from tools.terminal_scope import terminal_env
 
 
@@ -33,6 +34,7 @@ def profile_scope() -> dict | None:
     identity = hashlib.sha256(f'{deployment}\0{name}\0{home}'.encode()).hexdigest()[:16]
     return dict(profile=profile, profile_home=str(home), name=name, deployment=deployment,
                 identity=identity,
+                **firewall_config(),
                 mask_source=terminal_env('TERMINAL_DOCKER_MASK_SOURCE', ''),
                 hidden_files=json.loads(terminal_env('TERMINAL_DOCKER_HIDDEN_FILES', '[]')))
 
@@ -102,6 +104,7 @@ def connect(environment, task_label, profile_name, egress_label, network):
                     if started.returncode:
                         detail = started.stderr.strip() or started.stdout.strip() or f'exit code {started.returncode}'
                         raise RuntimeError(f"Cannot start profile Docker container {scope['name']}: {detail}")
+                apply_firewall(environment._docker_exe, current['Id'], scope)
                 environment._container_id = current['Id']
                 return True
             if not environment._image_available_locally():
@@ -109,5 +112,7 @@ def connect(environment, task_label, profile_name, egress_label, network):
             run_capture([environment._docker_exe, 'rm', '-f', current['Id']], timeout=30, check=True)
         elif 'No such' not in probe.stderr:
             raise RuntimeError('Cannot inspect profile Docker identity: ' + probe.stderr.strip())
-        environment._container_id = environment._docker_run(environment.cwd)
+        container_id = environment._docker_run(environment.cwd)
+        apply_firewall(environment._docker_exe, container_id, scope)
+        environment._container_id = container_id
         return False

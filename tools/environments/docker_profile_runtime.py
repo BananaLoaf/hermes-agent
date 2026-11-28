@@ -43,6 +43,8 @@ def apply_profile_labels(environment, image, resources, user_args, extra, *, req
                     forward_env=environment._forward_env,
                     automatic_mounts=environment._labels.get('hermes-environment', ''),
                     egress=environment._labels.get('hermes-egress', ''), cwd=environment.cwd)
+    if 'firewall' in scope:
+        material['firewall'] = scope['firewall']
     digest = hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
     environment._labels.update({
         'hermes-profile': scope['profile'],
